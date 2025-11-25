@@ -127,7 +127,7 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 hashed_password TEXT NOT NULL
             )
-        """)
+        """)       
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS results (
                 id SERIAL PRIMARY KEY,
@@ -559,7 +559,6 @@ def logout():
     
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-    # If already logged in as admin, go to dashboard (same pattern as user login)
     if session.get('admin_id'):
         return redirect(url_for('admin_dashboard'))
 
@@ -567,7 +566,6 @@ def admin_login():
         username = request.form.get("username")
         password = request.form.get("password")
 
-        # Use the same get_db_connection pattern as user login
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -576,24 +574,25 @@ def admin_login():
             )
             admin = cursor.fetchone()
 
-            # Use the helper verify_password for consistency with user login helpers
-            # Use the SAME method as user login
             if admin and check_password_hash(admin[2], password):
+                # Store minimal session data
                 session['admin_id'] = admin[0]
-                session['admin_username'] = admin[1]
-                session['is_admin'] = True      # <-- ADD THIS LINE
-
+                session['is_admin'] = True
+                # Only store username if absolutely necessary
+                # session['admin_username'] = admin[1]  
+                
+                # Clear session on browser close for admin accounts
+                session.permanent = False
+                
                 response = redirect(url_for("admin_dashboard"))
-                # Same cache headers as your user login
                 response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
                 response.headers['Pragma'] = 'no-cache'
                 response.headers['Expires'] = '0'
-                # You previously added frame options for admin — keep it
                 response.headers['X-Frame-Options'] = 'SAMEORIGIN'
                 return response
             else:
-                # Mirror user login's render_template_string signature (error + message)
-                return render_template_string(admin_login_html, error="Invalid admin credentials.", message=None)
+                # Use generic error message to avoid username enumeration
+                return render_template_string(admin_login_html, error="Invalid credentials", message=None)
 
     return render_template_string(admin_login_html, error=None, message=None)
 

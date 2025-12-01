@@ -31,6 +31,14 @@ load_dotenv()
 
 app = Flask(__name__)
 
+# Session configuration
+app.config.update(
+    SESSION_COOKIE_SECURE=False,  # Set to True in production with HTTPS
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30)
+)
+
 app.secret_key = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
 
 # --- Configuration & logging ---
@@ -51,10 +59,13 @@ csrf = CSRFProtect(app)
 
 # Rate limiter that prefers logged-in user id, otherwise IP
 def rate_limit_key():
-    return (
-        session.get("user_id") or  # ← Use user_id for both regular users AND admins
-        request.remote_addr
-    )
+    # Check for admin session first, then user session, then IP
+    if session.get('admin_id'):
+        return f"admin_{session.get('admin_id')}"
+    elif session.get('user_id'):
+        return f"user_{session.get('user_id')}"
+    else:
+        return request.remote_addr
 
 limiter = Limiter(
     key_func=rate_limit_key,
@@ -293,27 +304,25 @@ def init_db():
 
 init_db()
 
-#def login_required(role=None):
-#    def decorator(f):
-#        @wraps(f)
-#        def decorated_function(*args, **kwargs):
+def login_required(role=None):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            # ADMIN ROUTES - check for admin session
+            if role == "admin":
+                if not session.get('admin_id') or not session.get('is_admin'):
+                    flash("Please log in as admin to access this page.", "error")
+                    return redirect(url_for("admin_login"))
+                return f(*args, **kwargs)
 
-#            # ADMIN ROUTES
-#            if role == "admin":
-#                if "admin_id" not in session:
-#                    flash("Please log in as admin to access this page.", "error")
-#                    return redirect(url_for("admin_login"))
-#                return f(*args, **kwargs)
+            # USER ROUTES - check for user session
+            if "user_id" not in session:
+                flash("Please log in to access this page.", "error")
+                return redirect(url_for("login"))
 
-#            # USER ROUTES
-#            if "user_id" not in session:
-#                flash("Please log in to access this page.", "error")
-#                return redirect(url_for("login"))
-
-#            return f(*args, **kwargs)
-
-#        return decorated_function
-#    return decorator
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
 # --- Wallet & transactions ---
 def validate_wallet_sufficient(user_id, amount):
@@ -399,6 +408,11 @@ def log_user_activity():
             conn.commit()
     except Exception as e:
         logging.debug(f"Failed to log user activity: {e}")
+        
+@app.before_request
+def refresh_session():
+    if session.get('admin_id') or session.get('user_id'):
+        session.modified = True        
 
 @app.before_request
 def log_visitor():
@@ -547,19 +561,9 @@ def terms():
 def docs():
     return render_template_string(DOCS_CONTENT)
     
-
-@app.route("/logout")
-#@login_required()
-@limiter.limit("5 per hour")
-def logout():
-    session.pop('user_id', None)
-    session.pop('username', None)
-    flash("You have been logged out successfully.", "info")
-    return redirect(url_for("index"))
-    
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-    # If already logged in as admin, go to dashboard (same pattern as user login)
+    # If already logged in as admin, go to dashboard
     if session.get('admin_id'):
         return redirect(url_for('admin_dashboard'))
 
@@ -567,7 +571,6 @@ def admin_login():
         username = request.form.get("username")
         password = request.form.get("password")
 
-        # Use the same get_db_connection pattern as user login
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -576,23 +579,20 @@ def admin_login():
             )
             admin = cursor.fetchone()
 
-            # Use the helper verify_password for consistency with user login helpers
-            # Use the SAME method as user login
             if admin and check_password_hash(admin[2], password):
+                # Set ALL admin session variables
                 session['admin_id'] = admin[0]
                 session['admin_username'] = admin[1]
-                #session['is_admin'] = True
+                session['is_admin'] = True  # This is crucial for your existing checks
+                session.permanent = True  # Make session persistent
 
                 response = redirect(url_for("admin_dashboard"))
-                # Same cache headers as your user login
                 response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
                 response.headers['Pragma'] = 'no-cache'
                 response.headers['Expires'] = '0'
-                # You previously added frame options for admin — keep it
                 response.headers['X-Frame-Options'] = 'SAMEORIGIN'
                 return response
             else:
-                # Mirror user login's render_template_string signature (error + message)
                 return render_template_string(admin_login_html, error="Invalid admin credentials.", message=None)
 
     return render_template_string(admin_login_html, error=None, message=None)
@@ -825,12 +825,10 @@ def admin_add_allowed_user():
             return redirect(url_for("admin_dashboard", error="Failed to add allowed username."))
 
 @app.route("/admin/dashboard")
-#@login_required(role='admin')
-@limiter.limit("5 per hour")
+@login_required(role='admin')  # Use the decorator
+@limiter.limit("50 per hour")
 def admin_dashboard():
-    if not session.get("is_admin"):
-        return redirect(url_for("admin_login", error="Please log in as an admin."))
-
+    # Remove the manual admin check - decorator handles it
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users ORDER BY id ASC")
@@ -845,7 +843,7 @@ def admin_dashboard():
         logs=logs,
         error=request.args.get("error"),
         message=request.args.get("message")
-    )  
+    )
         
 @app.route("/admin/visitor_log")
 #@login_required(role='admin')
@@ -881,11 +879,24 @@ def view_visits():
     <br>
     <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
     """, logs=logs)
+    
+@app.route("/logout")
+#@login_required()
+@limiter.limit("5 per hour")
+def logout():
+    session.pop('user_id', None)
+    session.pop('username', None)
+    flash("You have been logged out successfully.", "info")
+    return redirect(url_for("index"))    
 
 @app.route("/admin/logout")
-#@login_required(role='admin')
+@login_required(role='admin')
 @limiter.limit("3 per hour")
 def admin_logout():
+    # Clear all admin-related session variables
+    session.pop('admin_id', None)
+    session.pop('admin_username', None)
+    session.pop('is_admin', None)
     session.clear()
     return redirect(url_for("admin_login"))
     
@@ -960,7 +971,17 @@ def cashbook():
             total_gross_profit = float(result[0]) if result and result[0] is not None else 0.0
             total_gross_profit = max(0.0, total_gross_profit)  # Ensure no negative
             
-            # 2. Total Profitable Games Count
+            # 2. Total User Balance (User Property)
+            cursor.execute("""
+                SELECT COALESCE(SUM(balance), 0) 
+                FROM users 
+                WHERE status = 'active'
+            """)
+            result = cursor.fetchone()
+            total_user_balance = float(result[0]) if result and result[0] is not None else 0.0
+            total_user_balance = max(0.0, total_user_balance)  # Ensure no negative
+            
+            # 3. Total Profitable Games Count
             cursor.execute("""
                 SELECT COUNT(*) 
                 FROM results 
@@ -969,7 +990,7 @@ def cashbook():
             result = cursor.fetchone()
             total_profitable_games = int(result[0]) if result and result[0] is not None else 0
             
-            # 3. Recent Profit Transactions (Last 5 only)
+            # 4. Recent Profit Transactions (Last 5 only)
             cursor.execute("""
                 SELECT 
                     game_code,
@@ -998,6 +1019,7 @@ def cashbook():
         
         cashbook_data = {
             "total_gross_profit": total_gross_profit,
+            "total_user_balance": total_user_balance,
             "total_profitable_games": total_profitable_games,
             "recent_profits": safe_recent_profits
         }
@@ -1009,6 +1031,7 @@ def cashbook():
         # Return safe default data on error
         cashbook_data = {
             "total_gross_profit": 0.0,
+            "total_user_balance": 0.0,
             "total_profitable_games": 0,
             "recent_profits": []
         }
@@ -1486,7 +1509,7 @@ def game_status():
     # Replace this with your actual game logic
     game_just_won = False  
 
-    return jsonify({'status': 'success' if game_just_won else 'pending'})            
+    return jsonify({'status': 'success' if game_just_won else 'pending'})          
                   
         
 #NON MONETARY ADMIN FUNCTIONS
@@ -2547,7 +2570,7 @@ cashbook_html = """
             color: white;
         }
         .container {
-            max-width: 800px;
+            max-width: 900px;
             margin: 0 auto;
         }
         .cashbook-windows {
@@ -2577,7 +2600,15 @@ cashbook_html = """
         }
         .financial-value {
             font-weight: bold;
+        }
+        .profit-value {
             color: #4CAF50;
+        }
+        .balance-value {
+            color: #2196F3;
+        }
+        .net-value {
+            color: #FF9800;
         }
         .back-link {
             text-align: center;
@@ -2617,6 +2648,37 @@ cashbook_html = """
             font-size: 0.9rem;
             margin-bottom: 15px;
         }
+        .financial-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .summary-card {
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        .summary-card h4 {
+            margin: 0 0 10px 0;
+            color: #ffcc00;
+        }
+        .summary-amount {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        .platform-profit { color: #4CAF50; }
+        .user-balance { color: #2196F3; }
+        .net-position { color: #FF9800; }
+        .warning-note {
+            background: rgba(255, 152, 0, 0.2);
+            border-left: 4px solid #FF9800;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }
     </style>
 </head>
 <body>
@@ -2626,22 +2688,53 @@ cashbook_html = """
             Last updated: <span id="currentTime"></span>
         </div>
         
+        <!-- Financial Summary Cards -->
+        <div class="financial-summary">
+            <div class="summary-card">
+                <h4>💰 Platform Profit</h4>
+                <div class="summary-amount platform-profit">Ksh. {{ "%.2f"|format(data.total_gross_profit) }}</div>
+                <small>Total earnings from games</small>
+            </div>
+            <div class="summary-card">
+                <h4>👥 User Balance</h4>
+                <div class="summary-amount user-balance">Ksh. {{ "%.2f"|format(data.total_user_balance) }}</div>
+                <small>Total user funds held</small>
+            </div>
+            <div class="summary-card">
+                <h4>📊 Net Position</h4>
+                <div class="summary-amount net-position">Ksh. {{ "%.2f"|format(data.total_gross_profit - data.total_user_balance) }}</div>
+                <small>Platform profit minus user funds</small>
+            </div>
+        </div>
+
+        <div class="warning-note">
+            <strong>💡 Important:</strong> User balance (Ksh. {{ "%.2f"|format(data.total_user_balance) }}) represents funds that belong to users and must be kept available for withdrawals.
+        </div>
+        
         <div class="cashbook-windows">
             <div class="cashbook-window">
-                <h3>ðŸ’° GROSS PLATFORM PROFIT</h3>
+                <h3>📈 PROFIT ANALYSIS</h3>
                 <div class="financial-item">
-                    <span>Total Profit:</span>
-                    <span class="financial-value">Ksh. {{ "%.2f"|format(data.total_gross_profit) }}</span>
+                    <span>Total Platform Profit:</span>
+                    <span class="financial-value profit-value">Ksh. {{ "%.2f"|format(data.total_gross_profit) }}</span>
                 </div>
                 <div class="financial-item">
-                    <span>Profitable Games:</span>
+                    <span>Total User Balance:</span>
+                    <span class="financial-value balance-value">Ksh. {{ "%.2f"|format(data.total_user_balance) }}</span>
+                </div>
+                <div class="financial-item">
+                    <span>Profitable Games Count:</span>
                     <span class="financial-value">{{ data.total_profitable_games }}</span>
+                </div>
+                <div class="financial-item" style="background: rgba(255, 152, 0, 0.2); border: 1px solid #FF9800;">
+                    <span><strong>Net Available Funds:</strong></span>
+                    <span class="financial-value net-value"><strong>Ksh. {{ "%.2f"|format(data.total_gross_profit - data.total_user_balance) }}</strong></span>
                 </div>
             </div>
         </div>
 
         <div class="cashbook-window">
-            <h3>ðŸ“ RECENT PROFIT TRANSACTIONS</h3>
+            <h3>📋 RECENT PROFIT TRANSACTIONS</h3>
             {% if data.recent_profits %}
             <table class="transaction-table">
                 <thead>
@@ -2679,7 +2772,7 @@ cashbook_html = """
         </div>
         
         <div class="back-link">
-            <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
+            <a href="/admin/dashboard">← Back to Admin Dashboard</a>
         </div>
     </div>
 

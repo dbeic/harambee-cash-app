@@ -1,1568 +1,518 @@
-from flask import Flask, render_template_string, request, redirect, url_for, flash, session, jsonify, get_flashed_messages
-import psycopg2
-from psycopg2 import sql
-from werkzeug.security import generate_password_hash, check_password_hash
-from hashlib import pbkdf2_hmac
-import binascii
-import hashlib
-import logging
+#Reverted 30 to latest
 import os
-import math
-import requests
 from dotenv import load_dotenv
-from datetime import timedelta, datetime
-from psycopg2.extras import DictCursor
-import boto3
-from botocore.exceptions import ClientError
-from werkzeug.utils import secure_filename
-from geopy.distance import geodesic
+import psycopg2
+from psycopg2 import errors
+import json
+import random
+import time
+import logging
+from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, Response, stream_with_context, flash
+from threading import Thread, Event
+from contextlib import contextmanager
+from psycopg2 import pool
+from psycopg2.errors import UniqueViolation
+import pytz
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask_wtf.csrf import CSRFProtect
+from urllib.parse import urlparse
+import threading
+import string
+from functools import wraps
+import secrets
+from werkzeug.security import generate_password_hash, check_password_hash
 from flask import send_from_directory
+from flask_wtf.csrf import CSRFProtect
+from datetime import datetime, timedelta, timezone
+from game_worker import run_game
+from shared import get_db_connection
 
-# Use session ID if available, else fallback to IP address
-def rate_limit_key():
-    return session.get("user_id") or get_remote_address()
-    
-# Load environment variables from .env
 load_dotenv()
 
 app = Flask(__name__)
+
+app.secret_key = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
+
+# --- Configuration & logging ---
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
+
+# Required environment vars
+CASH_DATABASE = os.getenv('CASH_DATABASE')
+CASH_USERNAME = os.getenv('CASH_USERNAME')
+CASH_PASSWORD = os.getenv('CASH_PASSWORD')
+
+if not all([CASH_USERNAME, CASH_PASSWORD]):
+    raise RuntimeError("Missing required environment variables: CASH_USERNAME and CASH_PASSWORD must be set.")
+
+# CSRF protection
 csrf = CSRFProtect(app)
 
-# Initialize Limiter
+# Rate limiter that prefers logged-in user id, otherwise IP
+def rate_limit_key():
+    return (
+        session.get("user_id") or  # ← Use user_id for both regular users AND admins
+        request.remote_addr
+    )
+
 limiter = Limiter(
-    app=app,
     key_func=rate_limit_key,
-    default_limits=["200 per day", "50 per hour"]
+    default_limits=[]
 )
+limiter.init_app(app)
 
-# Configuring Environment Variables
-app.secret_key = os.getenv('SECRET_KEY')
-CASH_DATABASE = os.getenv('CASH_DATABASE')
-ADMIN_USERNAME = os.getenv('ADMIN_USERNAME')
-ADMIN_EMAIL = os.getenv('ADMIN_EMAIL')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
-MPESA_CONSUMER_KEY = os.getenv('MPESA_CONSUMER_KEY')
-MPESA_CONSUMER_SECRET = os.getenv('MPESA_CONSUMER_SECRET')
-MPESA_SHORTCODE = os.getenv('MPESA_SHORTCODE')
-MPESA_PASSKEY = os.getenv('MPESA_PASSKEY')
+stop_event = threading.Event()
 
-# Remove Cloudinary imports and add S3 client
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.getenv('AWS_REGION', 'us-east-1')
-)
-S3_BUCKET = os.getenv('AWS_S3_BUCKET_NAME')
+# --- Utility functions ---
+def hashed_password(password: str) -> str:
+    return generate_password_hash(password.strip(), method='pbkdf2:sha256')
 
-# Validate critical environment variables
-required_vars = {
-    'SECRET_KEY': app.secret_key,
-    'CASH_DATABASE': CASH_DATABASE,
-    'ADMIN_USERNAME': ADMIN_USERNAME, 
-    'ADMIN_EMAIL': ADMIN_EMAIL,
-    'ADMIN_PASSWORD': ADMIN_PASSWORD,
-    'MPESA_CONSUMER_KEY': MPESA_CONSUMER_KEY,
-    'MPESA_CONSUMER_SECRET': MPESA_CONSUMER_SECRET,
-    'MPESA_SHORTCODE': MPESA_SHORTCODE,
-    'MPESA_PASSKEY': MPESA_PASSKEY
-}
-
-missing_vars = [var for var, value in required_vars.items() if not value]
-
-if missing_vars:
-    raise RuntimeError(f"Environment variables {', '.join(missing_vars)} must be set.")    
-
-# M-Pesa Functions
-def get_mpesa_access_token():
-    """Get M-Pesa access token"""
-    try:
-        response = requests.get(
-            'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
-            auth=(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET),
-            timeout=30
-        )
-        response.raise_for_status()
-        json_response = response.json()
-        return json_response.get('access_token')
-    except Exception as e:
-        logging.error(f"Error getting M-Pesa access token: {e}")
-        return None
-
-def get_mpesa_password():
-    """Generate M-Pesa password"""
-    return get_password()
+def verify_password(stored_hash: str, password: str) -> bool:
+    return check_password_hash(stored_hash, password.strip())
 
 def get_timestamp():
-    """Get current timestamp for M-Pesa"""
-    return datetime.now().strftime('%Y%m%d%H%M%S')
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
-def lipa_na_mpesa(phone_number, amount):
-    """Initiate M-Pesa payment"""
-    access_token = get_mpesa_access_token()
-    if not access_token:
-        return {'error': 'Access token generation failed'}
+def generate_game_code():
+    import string
+    return ''.join(random.choices(string.ascii_uppercase + '0123456789', k=6))
 
-    api_url = os.getenv('MPESA_LIPA_ONLINE_URL', 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest')
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
-
-    payload = {
-        "BusinessShortCode": os.getenv('MPESA_SHORTCODE', '4487938'),
-        "Password": get_mpesa_password(),
-        "Timestamp": get_timestamp(),
-        "TransactionType": "CustomerPayBillOnline",
-        "Amount": amount,
-        "PartyA": phone_number,
-        "PartyB": os.getenv('MPESA_PARTY_B', '4487938'),
-        "PhoneNumber": phone_number,
-        "CallBackURL": os.getenv('MPESA_CALLBACK_URL', 'https://ochuna-8a162e92f9ea.herokuapp.com/callback'),
-        "AccountReference": os.getenv('MPESA_ACCOUNT_REFERENCE', 'Payment for ochuna portals services'),
-        "TransactionDesc": os.getenv('MPESA_TRANSACTION_DESC', 'your_live_transaction_description')
-    }
-
-    try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            logging.error(f"Payment request failed: {response.text}")
-            return {'error': 'Payment request failed'}
-    except Exception as e:
-        logging.error(f"Error in lipa_na_mpesa: {e}")
-        return {'error': 'Payment request failed'}
-
-def generate_token():
-    """Generate M-Pesa token"""
-    return get_mpesa_access_token()
-    
-def get_media_items():
-    """Get media items from database"""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    media_items = []
-
-    try:
-        cur.execute('''
-            SELECT title, content, content_type, created_at, photo_filename, created_by
-            FROM media_content
-            ORDER BY created_at DESC
-        ''')
-        media_items_db = cur.fetchall()
-
-        for item in media_items_db:
-            item_dict = dict(item)
-            if item_dict['photo_filename']:
-                s3_url = get_s3_url(item_dict['photo_filename'])
-                item_dict['s3_url'] = s3_url
-            else:
-                item_dict['s3_url'] = None
-
-            media_items.append(item_dict)
-
-    except Exception as e:
-        flash(f"Error fetching media items: {e}", 'danger')
-    finally:
-        cur.close()
-        conn.close()
-
-    return media_items    
-
-# Generate M-Pesa password
-def get_password():
-    """Generate M-Pesa password using the shortcode, passkey, and timestamp."""
-    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    data_to_encode = MPESA_SHORTCODE + MPESA_PASSKEY + timestamp
-    encoded_string = data_to_encode.encode("utf-8")
-    password = binascii.b2a_base64(hashlib.sha256(encoded_string).digest()).decode("utf-8").strip()
-    return password
-    
-
-def get_db_connection():
-    """Get database connection and verify it's using the correct database"""
-    try:
-        conn = psycopg2.connect(CASH_DATABASE)  # This should be 8 spaces or 1 tab indent from function def
-        # Verify we're connected to the right database
-        with conn.cursor() as cur:
-            cur.execute("SELECT current_database()")
-            current_db = cur.fetchone()[0]
-            expected_db = ADMIN_DATABASE.split('/')[-1]
-            print(f"Connected to database: {current_db}")
-            if current_db != expected_db:
-                raise Exception(f"Connected to wrong database: {current_db}, expected: {expected_db}")
-        return conn
-    except psycopg2.OperationalError as e:
-        print(f"Error connecting to database: {e}")
-        raise
-
-        
-# Function to convert alphabetic characters to uppercase
-def process_input(input_string):
-    return ''.join(char.upper() if char.isalpha() else char for char in input_string)     
-
-def get_user_status(username):
-    """Get user status from database"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT status FROM users WHERE username = %s', (username,))
-        status = cur.fetchone()
-        return status[0] if status else None
-    finally:
-        cur.close()
-        conn.close()
-
-def generate_salt(length=16):
-    """Generates a cryptographically secure salt."""
-    return binascii.hexlify(os.urandom(length)).decode()
-
-def hash_password(password, salt, iterations=310000):
-    """Hashes a password with a given salt using PBKDF2-HMAC-SHA256."""
-    if not isinstance(password, str) or not isinstance(salt, str):
-        raise ValueError("Password and salt must be strings.")
-    if not password:
-        raise ValueError("Password cannot be empty.")
-    
-    # Convert hex salt back to bytes for hashing
-    salt_bytes = binascii.unhexlify(salt)
-    
-    # Hash the password
-    password_hash = hashlib.pbkdf2_hmac(
-        'sha256',
-        password.encode('utf-8'),
-        salt_bytes,
-        iterations
-    )
-    
-    return binascii.hexlify(password_hash).decode()
-
-def verify_password(password, stored_hash, salt, iterations=310000):
-    """Verifies a password against a stored hash and salt."""
-    try:
-        # Hash the provided password with the same salt and iterations
-        computed_hash = hash_password(password, salt, iterations)
-        
-        # Constant-time comparison to prevent timing attacks
-        return len(stored_hash) == len(computed_hash) and \
-               hashlib.sha256(stored_hash.encode()).hexdigest() == \
-               hashlib.sha256(computed_hash.encode()).hexdigest()
-    
-    except (ValueError, binascii.Error):
-        return False
-
-def log_transaction(username, action, details=None):
-    """Log user transaction"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute('INSERT INTO user_transactions (username, action, timestamp, details) VALUES (%s, %s, CURRENT_TIMESTAMP, %s)', 
-                    (username, action, details))
-        conn.commit()
-    except Exception as e:
-        print(f"Error logging transaction: {e}")
-    finally:
-        cur.close()
-        conn.close()
-        
-# Distance calculation function
-def haversine(lon1, lat1, lon2, lat2):
-    """Calculate distance between two points using Haversine formula"""
-    # Convert latitude and longitude from degrees to radians
-    lon1, lat1, lon2, lat2 = map(math.radians, [lon1, lat1, lon2, lat2])
-
-    # Haversine formula
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    # Radius of Earth in kilometers. Use 3956 for miles. Determines return value units.
-    R = 6371  
-    return R * c        
-
-def upload_to_s3(file, filename):
-    """Upload file to S3 and return the URL."""
-    try:
-        s3_client.upload_fileobj(
-            file,
-            S3_BUCKET,
-            filename,
-            ExtraArgs={'ACL': 'public-read'}  # Make file publicly accessible
-        )
-        # Generate the S3 URL
-        s3_url = f"https://{S3_BUCKET}.s3.{os.getenv('AWS_REGION')}.amazonaws.com/{filename}"
-        return s3_url
-    except Exception as e:
-        print(f"Error uploading to S3: {str(e)}")
-        return None
-
-def get_s3_url(filename):
-    """Generate S3 URL for a filename."""
-    if filename:
-        return f"https://{S3_BUCKET}.s3.{os.getenv('AWS_REGION')}.amazonaws.com/{filename}"
-    return None
-
-def try_auto_unlock():
-    """Attempt to auto-unlock user account"""
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT code, username FROM vouchers WHERE username IS NOT NULL LIMIT 1')
-        voucher = cur.fetchone()
-
-        if voucher:
-            code, username = voucher
-
-            cur.execute('UPDATE users SET status = %s WHERE username = %s', ('active', username))
-            cur.execute('INSERT INTO used_vouchers (code, username) VALUES (%s, %s)', (code, username))
-            cur.execute('DELETE FROM vouchers WHERE code = %s', (code,))
-            cur.execute('''
-                INSERT INTO user_requests (username, request_type, request_count)
-                VALUES (%s, %s, 1)
-                ON CONFLICT (username, request_type)
-                DO UPDATE SET request_count = user_requests.request_count + 1, requested_at = CURRENT_TIMESTAMP;
-            ''', (username, 'unlock_account'))
-            conn.commit()
-
-            return f'User {username} auto-unlocked successfully.'
-        return 'No eligible voucher found.'
-
-    except psycopg2.Error as e:
-        return f'Database error during unlock: {e}'
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
-            
-def check_user_tokens(username, tokens_required=1):
-    """Check if user has sufficient tokens"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT COUNT(*) FROM vouchers WHERE username = %s', (username,))
-        token_count = cur.fetchone()[0]
-        return token_count >= tokens_required
-    finally:
-        cur.close()
-        conn.close()
-
-def deduct_user_tokens(username, tokens_count=1):
-    """Deduct tokens from user account"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute('DELETE FROM vouchers WHERE username = %s LIMIT %s', (username, tokens_count))
-        conn.commit()
-        return cur.rowcount == tokens_count
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Error deducting tokens: {e}")
-        return False
-    finally:
-        cur.close()
-        conn.close()                                                                                       
-                        
+# --- Database initialization ---
 def init_db():
-    """Initialize database tables"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()                
-        # Create the table users
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            email VARCHAR(100) UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            role VARCHAR(20) NOT NULL DEFAULT 'user',
-            status VARCHAR(20) NOT NULL DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        ''')
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS mpesa_payments (
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
-                transaction_id TEXT UNIQUE NOT NULL,
-                phone TEXT NOT NULL,
-                sender_name TEXT,
-                amount NUMERIC(10,2),
-                message TEXT,
-                status TEXT DEFAULT 'unused',
-                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                email TEXT UNIQUE NOT NULL,
+                username TEXT UNIQUE NOT NULL,
+                hashed_password TEXT NOT NULL,
+                wallet NUMERIC DEFAULT 0.0
             )
         """)        
-        
-        # Create the user_interactions table
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS user_interactions (
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_activity (
                 id SERIAL PRIMARY KEY,
-                username VARCHAR(255) NOT NULL,
-                role VARCHAR(50),
-                status VARCHAR(50),
-                interaction_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        ''')        
-        
-        # Table creation for user_requests
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS user_requests (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(100) NOT NULL,
-                request_type VARCHAR(50) NOT NULL,  -- E.g., 'login', 'password_reset', etc.
-                request_count INT DEFAULT 1,        -- Tracks the number of requests by the user
-                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- Timestamp of the latest request
-                CONSTRAINT fk_username FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE,
-                CONSTRAINT unique_request UNIQUE (username, request_type)  -- Add this unique constraint
-            );
-        ''')                             
-        # Create the service_providers table
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS service_providers (
-            id SERIAL PRIMARY KEY,                     -- Auto-incrementing primary key
-            service_type VARCHAR(100) NOT NULL,        -- Service type (e.g., doctor, electrician)
-            phone_number VARCHAR(15) NOT NULL,         -- Phone number (should be unique per service type)
-            password VARCHAR(255) NOT NULL,            -- Hashed password
-            salt VARCHAR(255) NOT NULL,                -- Salt used for hashing the password
-            longitude DECIMAL(9,6) NOT NULL,           -- Longitude of the provider's location
-            latitude DECIMAL(9,6) NOT NULL,            -- Latitude of the provider's location
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- Timestamp of when the record was created
-            UNIQUE (phone_number, service_type)        -- Ensure unique phone number per service type
-        );
-        ''')               
-        
-        # Create the table
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS user_transactions (
-                id SERIAL PRIMARY KEY,
-                username TEXT NOT NULL,
-                action TEXT NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                details TEXT
-            );
-        ''')                 
-
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS roles (
-            id SERIAL PRIMARY KEY,
-            role_name TEXT UNIQUE NOT NULL
-        );
-        ''')
-
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS user_roles (
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
-            PRIMARY KEY (user_id, role_id)
-        );
-        ''')
-
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS calls (
-            id SERIAL PRIMARY KEY,
-            phone_number VARCHAR(15) NOT NULL,
-            service_type VARCHAR(50) NOT NULL,
-            latitude DECIMAL(9, 6) NOT NULL,
-            longitude DECIMAL(9, 6) NOT NULL,
-            call_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        ''')
+                username TEXT,
+                ip_address TEXT,
+                path TEXT,
+                method TEXT,
+                user_agent TEXT,
+                referrer TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS visit_logs (
+                id SERIAL PRIMARY KEY, 
+                ip_address TEXT,
+                user_agent TEXT,
+                referrer TEXT,
+                path TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS game_queue (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL UNIQUE,
+                timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                hashed_password TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                id SERIAL PRIMARY KEY,
+                game_code TEXT UNIQUE,
+                timestamp TIMESTAMP,
+                num_users INTEGER,
+                total_amount NUMERIC,
+                deduction NUMERIC,
+                winner TEXT,
+                winner_amount NUMERIC,
+                outcome_message TEXT,
+                status TEXT DEFAULT 'upcoming'
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('deposit', 'withdrawal', 'game_entry', 'win')),
+                amount NUMERIC NOT NULL,
+                timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                game_code TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS allowed_users (
+                username TEXT PRIMARY KEY
+            )
+        """)
+# Withdrawal requests
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawal_requests (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                requested_amount NUMERIC NOT NULL,
+                withdrawal_fee NUMERIC NOT NULL,
+                net_amount NUMERIC NOT NULL,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected', 'completed')),
+                request_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed_time TIMESTAMP NULL,
+                processed_by INTEGER NULL,
+                admin_notes TEXT,
+                receipt_code TEXT UNIQUE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(processed_by) REFERENCES admins(id) ON DELETE SET NULL
+            )
+        """)
+        # Deposit requests table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS deposit_requests (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                amount NUMERIC NOT NULL,
+                voucher_code TEXT UNIQUE NOT NULL,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'rejected')),
+                request_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed_time TIMESTAMP NULL,
+                processed_by INTEGER NULL,
+                admin_notes TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(processed_by) REFERENCES admins(id) ON DELETE SET NULL
+            )
+        """)
         
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS vouchers (
-            code TEXT PRIMARY KEY,
-            username TEXT,
-            created_at TIMESTAMP NOT NULL,
-            created_by TEXT NOT NULL,
-            valid_until TIMESTAMP NOT NULL
-        );
-        ''')
-
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS used_vouchers (
-            id SERIAL PRIMARY KEY,
-            code TEXT NOT NULL UNIQUE,
-            username TEXT NOT NULL,
-            used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        ''')
-
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS login_attempts (
-            id SERIAL PRIMARY KEY,
-            username TEXT REFERENCES users(username),
-            attempt_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            successful BOOLEAN
-        );
-        ''')
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_suspensions (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                suspension_end TIMESTAMP NOT NULL,
+                suspended_by INTEGER,
+                suspended_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(suspended_by) REFERENCES admins(id) ON DELETE SET NULL
+            )
+        """)           
+        # Withdrawal limits (tracks user withdrawal frequency)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawal_limits (
+                user_id INTEGER PRIMARY KEY,
+                last_withdrawal_time TIMESTAMP NULL,
+                daily_attempts INTEGER DEFAULT 0,
+                last_attempt_time TIMESTAMP NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        # Withdrawal fees (defines withdrawal fee brackets)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawal_fees (
+                id SERIAL PRIMARY KEY,
+                min_amount NUMERIC NOT NULL,
+                max_amount NUMERIC NOT NULL,
+                fee_amount NUMERIC DEFAULT 0,
+                fee_percentage NUMERIC DEFAULT 0,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        """)        
+        # Win earnings (tracks usersâ€™ winnings from games)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS win_earnings (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                game_code TEXT NOT NULL,
+                amount NUMERIC NOT NULL,
+                earned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_withdrawn BOOLEAN DEFAULT FALSE,
+                withdrawn_at TIMESTAMP NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("SELECT COUNT(*) FROM withdrawal_fees")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO withdrawal_fees (min_amount, max_amount, fee_amount, fee_percentage, is_active) 
+                VALUES 
+                (100, 1000, 10, 0, TRUE),
+                (1001, 5000, 25, 0, TRUE),
+                (5001, 20000, 50, 0, TRUE),
+                (20001, 50000, 100, 0, TRUE)
+            """)        
         
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS media_content (
-            id SERIAL PRIMARY KEY,
-            title VARCHAR(255) NOT NULL,
-            content TEXT,
-            content_type VARCHAR(50),
-            photo_filename VARCHAR(255),
-            created_by VARCHAR(100),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        ''')        
-
-        # Insert default roles
-        cur.execute('''
-        INSERT INTO roles (role_name) VALUES ('admin'), ('user'), ('moderator')
-        ON CONFLICT(role_name) DO NOTHING;
-        ''')
-
-        conn.commit()
-        cur.close()
-        conn.close()
-        print("Database initialized successfully")
-    except psycopg2.Error as e:
-        print(f"Error initializing database: {e}")
-
-def insert_initial_admin():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Check if the admin already exists
-        cur.execute("SELECT id FROM users WHERE username = %s", (ADMIN_USERNAME,))
-        admin_exists = cur.fetchone()
-
-        if not admin_exists:
-            # Generate a secure password and hash it
-            password = ADMIN_PASSWORD
-            salt = generate_salt()
-            hashed_password = hash_password(password, salt)
-
-            # Insert the initial admin user - THIS IS CORRECT
-            cur.execute('''
-                INSERT INTO users (username, email, password_hash, salt, role, status)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING id
-            ''', (ADMIN_USERNAME, ADMIN_EMAIL, hashed_password, salt, 'admin', 'active'))
-            admin_id = cur.fetchone()[0]
-
-            # Assign the admin role to the initial admin
-            cur.execute('''
-                INSERT INTO user_roles (user_id, role_id)
-                SELECT %s, id FROM roles WHERE role_name = %s
-            ''', (admin_id, 'admin'))
-
+        # Add performance indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_queue_user_id ON game_queue(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_results_status ON results(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_user_id ON withdrawal_requests(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_deposit_requests_user_id ON deposit_requests(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_admins_username ON admins(username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_activity_username ON user_activity(username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_activity_timestamp ON user_activity(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_visit_logs_timestamp ON visit_logs(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_visit_logs_ip ON visit_logs(ip_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transactions_game_code ON transactions(game_code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_results_timestamp ON results(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_results_game_code ON results(game_code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_status ON withdrawal_requests(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_timestamp ON withdrawal_requests(request_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_deposit_requests_status ON deposit_requests(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_deposit_requests_timestamp ON deposit_requests(request_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_deposit_requests_voucher_code ON deposit_requests(voucher_code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_suspensions_user_id ON user_suspensions(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_suspensions_end ON user_suspensions(suspension_end)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_win_earnings_user_id ON win_earnings(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_win_earnings_game_code ON win_earnings(game_code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_win_earnings_withdrawn ON win_earnings(is_withdrawn)")          
+        
+        cursor.execute("SELECT id FROM admins WHERE username = %s LIMIT 1", (CASH_USERNAME,))
+        exists = cursor.fetchone()
+        if not exists:
+            hashed = generate_password_hash(CASH_PASSWORD)
+            cursor.execute("INSERT INTO admins (username, hashed_password) VALUES (%s, %s)", (CASH_USERNAME, hashed))
             conn.commit()
-            print("Initial admin added successfully.")
-            print()
-        else:
-            print("Initial admin already exists.")          
+            print('Admin created successfully')
+            print(CASH_USERNAME, CASH_PASSWORD)
 
-    except psycopg2.Error as e:
-        print(f"Error inserting initial admin: {e}")
 
-    finally:
-        cur.close()
-        conn.close()
+init_db()
 
-# Initialize database and admin
-init_db()                
-insert_initial_admin()
+#def login_required(role=None):
+#    def decorator(f):
+#        @wraps(f)
+#        def decorated_function(*args, **kwargs):
 
-# Routes
-@app.route('/')
-def index():
-    return render_template_string(index_html)
+#            # ADMIN ROUTES
+#            if role == "admin":
+#                if "admin_id" not in session:
+#                    flash("Please log in as admin to access this page.", "error")
+#                    return redirect(url_for("admin_login"))
+#                return f(*args, **kwargs)
 
-@app.route('/login', methods=['GET', 'POST'])
-@limiter.limit("5 per minute")
-def login():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+#            # USER ROUTES
+#            if "user_id" not in session:
+#                flash("Please log in to access this page.", "error")
+#                return redirect(url_for("login"))
 
-        if not username or not password:
-            flash('Username and password are required.', 'danger')
-            log_transaction(username, 'failed_login', 'Missing username or password.')
-            return redirect(url_for('login'))
+#            return f(*args, **kwargs)
 
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
+#        return decorated_function
+#    return decorator
 
-            # Log login attempt
-            log_transaction(username, 'login_attempt', f'User {username} attempted to login.')
-
-            # Fetch user details - handle both password and password_hash scenarios
-            try:
-                cur.execute('SELECT id, password_hash, salt, role, status FROM users WHERE username = %s', (username,))
-                user_info = cur.fetchone()
-            except psycopg2.Error:
-                # If password_hash doesn't exist, try password
-                cur.execute('SELECT id, password, salt, role, status FROM users WHERE username = %s', (username,))
-                user_info = cur.fetchone()
-
-            if user_info:
-                user_id, password_hash, salt, role, status = user_info
-
-                if status == 'locked':
-                    # Attempt auto-unlock before rejecting the login
-                    unlock_status = try_auto_unlock()
-                    log_transaction(username, 'auto_unlock_attempt', unlock_status)
-
-                    # Fetch status again to check if unlock succeeded
-                    cur.execute('SELECT status FROM users WHERE username = %s', (username,))
-                    updated_status = cur.fetchone()[0]
-                    
-                    if updated_status == 'active':
-                        flash('Your account was locked but has been automatically unlocked. Please try logging in again.', 'info')
-                        return redirect(url_for('login'))
-                    
-                    else:
-                        flash('Your account is locked. Please enter a valid token to unlock it.', 'danger')
-                        return redirect(url_for('unlock_account'))
-
-                # ONLY THIS LINE CHANGED - from hash_password() to verify_password()
-                elif verify_password(password, password_hash, salt):
-                    # Successful login - ALL ORIGINAL LOGIC PRESERVED
-                    session['username'] = username
-                    session['role'] = role
-                    session['is_admin'] = (role == 'admin')
-
-                    # Check request count for the token
-                    cur.execute('SELECT COUNT(*) FROM user_requests WHERE username = %s AND request_type = %s', (username, 'login'))
-                    request_count = cur.fetchone()[0]
-
-                    if request_count < 10:
-                        # Increment the request count and log the request
-                        cur.execute('''
-                            INSERT INTO user_requests (username, request_type, requested_at)
-                            VALUES (%s, %s, CURRENT_TIMESTAMP)
-                            ON CONFLICT (username, request_type)
-                            DO UPDATE SET requested_at = CURRENT_TIMESTAMP
-                        ''', (username, 'login'))
-                        conn.commit()
-
-                        # Log successful login
-                        log_transaction(username, 'login', f'User {username} logged in successfully.')
-                        flash('Login successful!', 'success')
-                        return redirect(url_for('dashboard'))
-                    else:
-                        # Archive user details and lock the account
-                        cur.execute('INSERT INTO user_interactions (username, role, status) VALUES (%s, %s, %s)', 
-                                    (username, role, status))
-                        cur.execute('UPDATE users SET status = %s WHERE username = %s', ('locked', username))
-                        conn.commit()
-
-                        # Log account locking due to token usage limit
-                        log_transaction(username, 'account_locked', f'User {username} account locked due to token usage limit.')
-                        flash('Token usage limit reached. Your account is locked for further analysis.', 'warning')
-                        return redirect(url_for('index'))
-                else:
-                    # Log invalid password attempt
-                    log_transaction(username, 'failed_login', f'User {username} entered an invalid password.')
-                    flash('Invalid password. Please try again.', 'danger')
-            else:
-                # Log invalid username attempt
-                log_transaction(username, 'failed_login', f'User {username} entered an invalid username.')
-                flash('Invalid username. Please try again.', 'danger')
-
-        except psycopg2.Error as e:
-            # Log any database error
-            log_transaction(username, 'login_error', f"Login error: {e}")
-            flash(f"Login error: {e}", 'danger')
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
-
-    return render_template_string(login_html)
-    
-# Route for unlocking account
-@app.route('/unlock_account', methods=['GET', 'POST'])
-@limiter.limit("5 per minute")
-def unlock_account():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        token = request.form.get('token')
-
-        # Check if both username and token are provided
-        if not token or not username:
-            flash('Both username and token are required.', 'danger')
-            return redirect(url_for('unlock_account'))
-
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            # Check if the token exists in the vouchers table
-            cur.execute('SELECT code FROM vouchers WHERE code = %s', (token,))
-            token_record = cur.fetchone()
-
-            if token_record:
-                # Unlock the user account if the token is valid
-                cur.execute('UPDATE users SET status = %s WHERE username = %s', ('active', username))
-
-                # Insert the token into the used_vouchers table
-                cur.execute('INSERT INTO used_vouchers (code, username) VALUES (%s, %s)', (token, username))
-
-                # Delete the token from the vouchers table
-                cur.execute('DELETE FROM vouchers WHERE code = %s', (token,))
-
-                # Log the unlock action in the user_requests table
-                cur.execute('''
-                    INSERT INTO user_requests (username, request_type, request_count)
-                    VALUES (%s, %s, 1)
-                    ON CONFLICT (username, request_type)
-                    DO UPDATE SET request_count = user_requests.request_count + 1, requested_at = CURRENT_TIMESTAMP;
-                ''', (username, 'unlock_account'))
-
-                conn.commit()
-
-                flash('Your account has been unlocked successfully!', 'success')
-                return redirect(url_for('login'))
-
-            else:
-                flash('Invalid or already used token. Please try again.', 'danger')
-
-        except psycopg2.Error as e:
-            flash(f"Error unlocking account: {e}", 'danger')
-
-        finally:
-            # Ensure the cursor and connection are closed
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
-
-    return render_template_string(unlock_account_html)
-    
-@app.route('/auto_unlock', methods=['POST'])
-@limiter.limit("10 per minute")
-def save_payment():
-    phone = request.form.get('phone')
-    transaction_id = request.form.get('transaction_id')
-    amount = request.form.get('amount')
-    sender_name = request.form.get('sender_name')
-    raw_message = request.form.get('message')
-
-    if not phone or not transaction_id or not amount:
-        return "Missing required fields", 400
-
+# --- Wallet & transactions ---
+def validate_wallet_sufficient(user_id, amount):
+    """Check if user has sufficient wallet balance"""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Save payment to mpesa_payments
-        cur.execute('''
-            INSERT INTO mpesa_payments (phone, transaction_id, amount, sender_name, raw_message)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (transaction_id) DO NOTHING
-        ''', (phone, transaction_id, amount, sender_name, raw_message))
-
-        # Save transaction_id to vouchers (if not already there)
-        cur.execute('SELECT 1 FROM vouchers WHERE code = %s', (transaction_id,))
-        if not cur.fetchone():
-            created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            valid_until = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-            created_by = session.get('username', 'manual')
-
-            cur.execute('''
-                INSERT INTO vouchers (code, created_at, created_by, valid_until)
-                VALUES (%s, %s, %s, %s)
-            ''', (transaction_id, created_at, created_by, valid_until))
-
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        return "Payment saved and voucher created", 200
-
+        balance = get_wallet_balance(user_id)
+        return balance >= amount
     except Exception as e:
-        return f"Error: {str(e)}", 500  
+        logging.error(f"Error validating wallet for user {user_id}: {e}")
+        return False
 
-# Register a new user with a voucher code or M-Pesa payment
-@app.route('/register', methods=['GET', 'POST'])
+def get_wallet_balance(user_id):
+    if not user_id:
+        return 0.0
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT wallet FROM users WHERE id = %s", (user_id,))
+            result = cursor.fetchone()
+            if result and result[0] is not None:
+                return float(result[0])
+            else:
+                logging.warning(f"User {user_id} not found or has null wallet balance")
+                return 0.0
+    except Exception as e:
+        logging.error(f"Error getting wallet balance for user {user_id}: {e}")
+        return 0.0
+
+def update_wallet(user_id, amount):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET wallet = wallet + %s WHERE id = %s", (amount, user_id))
+        conn.commit()
+
+def log_transaction(user_id, transaction_type, amount):
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO transactions (user_id, type, amount, timestamp)
+                VALUES (%s, %s, %s, %s)
+            """, (user_id, transaction_type, amount, get_timestamp()))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Error in log_transaction(): {e}")
+
+# --- Logging visitors / activity ---
+def log_visit_entry(ip_address, user_agent, referrer=None, page=None, timestamp=None):
+    # Ensure timestamp is always a string
+    if timestamp is None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+    elif isinstance(timestamp, datetime):
+        ts = timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")
+    else:
+        ts = str(timestamp)
+
+    # Insert visit log into the database
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO visit_logs (ip_address, user_agent, referrer, path, timestamp)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (ip_address, user_agent, referrer, page, ts))
+        conn.commit()           
+
+@app.before_request
+def log_user_activity():
+    if request.path.startswith("/static"):
+        return
+    try:
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        ua = request.headers.get("User-Agent", "")
+        ref = request.referrer
+        path = request.path
+        method = request.method
+        username = session.get("username")
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO user_activity (username, ip_address, path, method, user_agent, referrer)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (username, ip, path, method, ua, ref))
+            conn.commit()
+    except Exception as e:
+        logging.debug(f"Failed to log user activity: {e}")
+
+@app.before_request
+def log_visitor():
+    if request.path.startswith("/static"):
+        return
+    try:
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        agent = request.headers.get('User-Agent', 'unknown')
+        ref = request.referrer or 'direct'
+        path = request.path
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_visit_entry(ip, agent, ref, path, ts)
+    except Exception as e:
+        logging.debug(f"Visitor log error: {e}")
+
+# --- Static files route (exposed) ---
+@csrf.exempt
+@app.route("/static/<path:filename>")
+def static_files(filename):
+    return send_from_directory("static", filename)
+
+
+#Routes
+@app.route("/")
+@limiter.limit("200 per minute")
+def index():
+    if 'user_id' in session:
+        wallet_balance = get_wallet_balance(session['user_id'])
+    else:
+        wallet_balance = 0.0
+        
+    return render_template_string(base_html, 
+                                wallet_balance=wallet_balance,
+                                session=session)
+          
+                
+@app.route("/login", methods=["GET", "POST"])
+@limiter.limit("5 per minute, 20 per hour")
+def login():
+    if session.get('user_id'):
+        return redirect(url_for('index'))
+
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+
+        # Rely on CSRFProtect for CSRF verification (token injected into template).
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, username, hashed_password FROM users WHERE username = %s", (username,))
+            user = cursor.fetchone()
+
+            if user and check_password_hash(user[2], password):
+                session['user_id'] = user[0]
+                session['username'] = user[1]
+                response = redirect(url_for("index"))
+                response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+                response.headers['Pragma'] = 'no-cache'
+                response.headers['Expires'] = '0'
+                return response
+            else:
+                return render_template_string(login_html, error="Invalid username or password.", message=None)             
+
+    return render_template_string(login_html, error=None, message=None)
+
+@app.route("/register", methods=["GET", "POST"])
 @limiter.limit("5 per minute")
 def register():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        email = request.form.get('email')
-        password = request.form.get('password')
-        voucher = request.form.get('voucher')
+    if request.method == "POST":
+        email = request.form.get("email")
+        username = request.form.get("username")
+        password = request.form.get("password")
 
-        if not username or not email or not password or not voucher:
-            flash('All fields are required.', 'danger')
-            return redirect(url_for('register'))
+        # Basic validation
+        if not all([email, username, password]):
+            return render_template_string(register_html, error="All fields are required")
 
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
 
-            # Check if user is locked
-            cur.execute('SELECT status FROM users WHERE username = %s', (username,))
-            user_status = cur.fetchone()
+            # Check if username is allowed
+            cursor.execute("SELECT 1 FROM allowed_users WHERE username = %s", (username,))
+            if cursor.fetchone() is None:
+                return render_template_string(register_html, error="Username is not allowed")
 
-            if user_status and user_status[0] == 'locked':
-                # Validate the voucher for unlocking the account
-                cur.execute('SELECT * FROM vouchers WHERE code = %s', (voucher,))
-                voucher_info = cur.fetchone()
+            # Hash password
+            hashed_password = generate_password_hash(password)
 
-                if voucher_info:
-                    # Unlock the account by updating the status
-                    cur.execute('DELETE FROM vouchers WHERE code = %s', (voucher,))
-                    cur.execute('UPDATE users SET status = %s WHERE username = %s', ('active', username))
-                    conn.commit()
+            try:
+                # Insert new user
+                cursor.execute(
+                    "INSERT INTO users (email, username, hashed_password) VALUES (%s, %s, %s)",
+                    (email, username, hashed_password)
+                )
 
-                    # Log the transaction for account unlocking
-                    log_transaction(username, 'unlock', f'User {username} unlocked their account using a voucher.')
+                # Remove the username from allowed_users so it can't be reused
+                cursor.execute("DELETE FROM allowed_users WHERE username = %s", (username,))
 
-                    # Update the request_count in user_requests or insert a new entry if it doesn't exist
-                    cur.execute('SELECT request_count FROM user_requests WHERE username = %s AND request_type = %s', 
-                                (username, 'unlock'))
-                    request_record = cur.fetchone()
+                conn.commit()
+                return redirect(url_for("login"))
 
-                    if request_record:
-                        cur.execute('''
-                            UPDATE user_requests 
-                            SET request_count = request_count + 1, requested_at = CURRENT_TIMESTAMP
-                            WHERE username = %s AND request_type = %s
-                        ''', (username, 'unlock'))
-                    else:
-                        cur.execute('''
-                            INSERT INTO user_requests (username, request_type, request_count, requested_at)
-                            VALUES (%s, %s, 1, CURRENT_TIMESTAMP)
-                        ''', (username, 'unlock'))
-                    conn.commit()
+            except UniqueViolation:
+                conn.rollback()
+                return render_template_string(register_html, error="Email or username already exists")
 
-                    flash('Your account has been unlocked. Please log in.', 'success')
-                    return redirect(url_for('login'))
-                else:
-                    # Invalid voucher, redirect to M-Pesa payment page
-                    flash('Invalid or already used voucher code. Please complete payment.', 'danger')
-                    return redirect(url_for('mpesa_payment'))
-            else:
-                # Normal registration process for new users
-                cur.execute('SELECT * FROM vouchers WHERE code = %s', (voucher,))
-                voucher_info = cur.fetchone()
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Database error during registration: {e}")
+                return render_template_string(register_html, error="Something went wrong. Try again later.")
 
-                if voucher_info:
-                    # Voucher is valid, proceed with registration
-                    cur.execute('DELETE FROM vouchers WHERE code = %s', (voucher,))
-                    cur.execute('INSERT INTO used_vouchers (code, username) VALUES (%s, %s)', (voucher, username))
-                    conn.commit()
-
-                    # Define the salt and hashed password
-                    salt = generate_salt()
-                    hashed_password = hash_password(password, salt)
-
-                    try:
-                        cur.execute('''
-                        INSERT INTO users (username, email, password_hash, salt, role, status)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ''', (username, email, hashed_password, salt, 'user', 'active'))
-                        
-                        # Log the transaction for registration
-                        log_transaction(username, 'register', f'User {username} registered.')
-
-                        # Insert into user_requests to start tracking request count for the new user
-                        cur.execute('''
-                            INSERT INTO user_requests (username, request_type, request_count, requested_at)
-                            VALUES (%s, %s, 1, CURRENT_TIMESTAMP)
-                        ''', (username, 'register'))
-                        conn.commit()
-
-                        flash('Registration successful! Please log in.', 'success')
-                        return redirect(url_for('login'))
-                    except psycopg2.IntegrityError:
-                        flash('This username or email is already taken. Please choose another one.', 'danger')
-                else:
-                    # Invalid voucher, redirect to M-Pesa payment page
-                    flash('The voucher code you entered is invalid or has already been used. Please complete payment.', 'danger')
-                    return redirect(url_for('mpesa_payment'))
-
-        except psycopg2.Error as e:
-            flash(f"Registration error: {e}", 'danger')
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
-
+    # GET request â€” show registration form
     return render_template_string(register_html)
-    
-# Route to render the payment page
-@app.route('/mpesa_payment')
-def mpesa_payment():
-    return render_template_string(mpesa_payment_html)
 
-# Route to initiate M-Pesa payment
-@app.route('/pay', methods=['GET', 'POST'])
-def pay():
-    if request.method == 'POST':
-        phone_number = request.form.get('phone_number')
-        amount = 20 
-        
-        try:
-            response = lipa_na_mpesa(phone_number, amount)
 
-            if response and response.get('ResponseCode') == '0':
-                flash('Payment initiated. Please check your phone to complete the transaction.', 'success')
-            else:
-                flash('Payment initiation failed. Please try again.', 'danger')
-                
-        except KeyError as ke:
-            logging.error(f"Missing key in response: {str(ke)}")
-            flash('Error initiating payment. Please check your credentials or contact support.', 'danger')
-        
-        except Exception as e:
-            logging.error(f"Error during M-Pesa payment initiation: {str(e)}")
-            flash('Something went wrong while initiating payment. Please try again or contact support.', 'danger')
-
-        return redirect(url_for('mpesa_payment'))
-
-    return render_template_string(mpesa_payment_html)
-
-# M-Pesa callback route
-@app.route('/callback', methods=['POST'])
-def mpesa_callback():
-    try:
-        mpesa_data = request.json
-        if not mpesa_data:
-            logging.error("No JSON data received in M-Pesa callback.")
-            return jsonify({"ResultCode": 1, "ResultDesc": "Invalid data"}), 400
-
-        result_code = mpesa_data.get('Body', {}).get('stkCallback', {}).get('ResultCode', None)
-        if result_code is None:
-            logging.error("ResultCode missing in M-Pesa callback.")
-            return jsonify({"ResultCode": 1, "ResultDesc": "Invalid callback format"}), 400
-
-        if result_code == 0:
-            transaction_id = mpesa_data['Body']['stkCallback'].get('CheckoutRequestID')
-            metadata_items = mpesa_data['Body']['stkCallback'].get('CallbackMetadata', {}).get('Item', [])
-
-            if len(metadata_items) >= 5:
-                amount = metadata_items[0].get('Value')
-                phone_number = metadata_items[4].get('Value')
-
-                if amount and phone_number:
-                    # Convert M-Pesa format (254XXX) to username format (0XXX)
-                    if phone_number.startswith('254'):
-                        username = '0' + phone_number[3:]
-                    else:
-                        username = phone_number
-                    
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    
-                    # Calculate tokens based on amount (2 KES per token)
-                    tokens_to_create = int(int(amount) / 2)
-                    
-                    for i in range(tokens_to_create):
-                        token_code = f"MPESA_{transaction_id}_{i}"
-                        created_at = datetime.now()
-                        valid_until = created_at + timedelta(days=30)  # Same 30-day validity
-                        
-                        cur.execute('''
-                            INSERT INTO vouchers (code, username, created_at, created_by, valid_until)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (code) DO NOTHING
-                        ''', (token_code, username, created_at, 'mpesa_system', valid_until))
-                    
-                    conn.commit()
-                    logging.info(f"M-Pesa: Assigned {tokens_to_create} tokens to user {username}")
-                    
-                    cur.close()
-                    conn.close()
-                    
-        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"}), 200
-
-    except Exception as e:
-        logging.error(f"Error processing M-Pesa callback: {str(e)}")
-        return jsonify({"ResultCode": 1, "ResultDesc": "Error processing request"}), 500
-    
-@app.route('/admin_reset_password', methods=['GET', 'POST'])
-@limiter.limit("5 per minute")
-def admin_reset_password():
-    if 'role' not in session or session['role'] != 'admin':
-        flash('Access denied. Only admins can reset passwords.', 'danger')
-        return redirect(url_for('login'))
-    
-    if request.method == 'POST':
-        username = request.form.get('username')
-        new_password = request.form.get('new_password')
-
-        if not username or not new_password:
-            flash('Username and new password are required.', 'danger')
-            return redirect(url_for('admin_reset_password'))
-
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            # Check if the user exists
-            cur.execute('SELECT id, username FROM users WHERE username = %s', (username,))
-            user_info = cur.fetchone()
-
-            if user_info:
-                # User exists, generate salt and hash the new password
-                salt = generate_salt()
-                hashed_password = hash_password(new_password, salt)
-
-                # Update the password in the database
-                cur.execute('UPDATE users SET password_hash = %s, salt = %s WHERE username = %s', 
-                            (hashed_password, salt, username))
-                conn.commit()
-
-                # Log the password reset
-                log_transaction(session['username'], 'admin_password_reset', f'Admin reset password for user {username}.')
-
-                flash(f'Password reset successfully for user {username}.', 'success')
-                flash(f'New password for {username} is: {new_password}', 'info')
-            else:
-                flash('User not found.', 'danger')
-
-        except psycopg2.Error as e:
-            flash(f"Error resetting password: {e}", 'danger')
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
-
-    return render_template_string(admin_reset_password_html)
-    
-@app.route('/check-auth')
-def check_auth():
-    """Check if user is authenticated for frontend JavaScript"""
-    if 'username' in session:
-        return jsonify({
-            'authenticated': True,
-            'user': {
-                'name': session.get('username'),
-                'id': session.get('user_id', ''),
-                'phone': session.get('username')  # Using username as phone
-            }
-        })
-    return jsonify({'authenticated': False})    
-    
-@app.route('/dashboard')
-def dashboard():
-    # Fetch is_admin and account_status from session
-    is_admin = session.get('is_admin', False)
-    account_status = session.get('account_status', 'active')
-    
-    # Fetch media items
-    media_items = get_media_items()
-    
-    # CALCULATE TOKEN BALANCE
-    token_balance = 0.0
-    if 'username' in session:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute('SELECT COUNT(*) FROM vouchers WHERE username = %s', (session['username'],))
-            token_count = cur.fetchone()[0]
-            token_balance = float(token_count)  # Convert to float for display
-        except Exception as e:
-            print(f"Error fetching token balance: {e}")
-        finally:
-            cur.close()
-            conn.close()
-
-    # Render dashboard with the appropriate context
-    return render_template_string(dashboard_html, 
-                                  is_admin=is_admin, 
-                                  account_status=account_status, 
-                                  media_items=media_items,
-                                  token_balance=token_balance)
-                                  
-                                  
-@app.route('/upload_media', methods=['GET', 'POST'])
-def upload_media():
-    if 'username' not in session or session.get('role') != 'admin':  # ADD ADMIN CHECK
-        flash('Access denied. Only admins can upload media.', 'danger')
-        return redirect(url_for('dashboard'))  
-    
-    if request.method == 'POST':
-        title = request.form.get('title')
-        content = request.form.get('content')
-        media_file = request.files.get('media_file')
-        
-        if not title or not media_file:
-            flash('Title and media file are required.', 'danger')
-            return redirect(url_for('upload_media'))
-        
-        try:
-            # Secure filename and upload to S3
-            filename = secure_filename(media_file.filename)
-            s3_url = upload_to_s3(media_file, filename)
-            
-            if s3_url:
-                # Save to database
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute('''
-                    INSERT INTO media_content (title, content, content_type, photo_filename, created_by)
-                    VALUES (%s, %s, %s, %s, %s)
-                ''', (title, content, media_file.content_type, filename, session['username']))
-                conn.commit()
-                cur.close()
-                conn.close()
-                
-                flash('Media uploaded successfully!', 'success')
-                return redirect(url_for('dashboard'))
-            else:
-                flash('Failed to upload media to storage.', 'danger')
-                
-        except Exception as e:
-            flash(f'Error uploading media: {str(e)}', 'danger')
-    
-    return render_template_string(upload_media_html)
-                                                                                                                                       
-@app.route('/add_token', methods=['GET', 'POST'])
-def add_token():
-    if 'username' not in session or session.get('role') != 'admin':
-        flash("Unauthorized access. Admins only.", 'danger')
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        username = request.form.get('username')  # User's phone number
-        amount = request.form.get('amount')      # Payment amount in KES
-        payment_method = request.form.get('payment_method')  # Cash, Bank, etc.
-
-        if not username or not amount:
-            flash("Username and amount are required.", 'danger')
-            return redirect(url_for('add_token'))
-
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            # Check if user exists
-            cur.execute('SELECT id FROM users WHERE username = %s', (username,))
-            user_exists = cur.fetchone()
-
-            if not user_exists:
-                flash("User does not exist. Please ask user to register first.", 'danger')
-                return redirect(url_for('add_token'))
-
-            # Calculate tokens based on amount (2 KES per token)
-            tokens_to_create = int(int(amount) / 2)
-            
-            if tokens_to_create < 1:
-                flash("Minimum amount is KES 2 for 1 token.", 'danger')
-                return redirect(url_for('add_token'))
-
-            # Generate unique transaction ID for manual payment
-            transaction_id = f"MANUAL_{datetime.now().strftime('%Y%m%d%H%M%S')}_{username}"
-            
-            # Create tokens (same structure as M-Pesa tokens)
-            for i in range(tokens_to_create):
-                token_code = f"{transaction_id}_{i}"
-                created_at = datetime.now()
-                valid_until = created_at + timedelta(days=30)  # Same 30-day validity
-                
-                cur.execute('''
-                    INSERT INTO vouchers (code, username, created_at, created_by, valid_until)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (code) DO NOTHING
-                ''', (token_code, username, created_at, session['username'], valid_until))
-
-            # Log the manual payment transaction
-            cur.execute('''
-                INSERT INTO mpesa_payments (phone, transaction_id, amount, sender_name, status)
-                VALUES (%s, %s, %s, %s, %s)
-            ''', (username, transaction_id, amount, f"Manual by {session['username']}", 'manual_payment'))
-
-            conn.commit()
-
-            # Log admin action
-            log_transaction(session['username'], 'manual_token_add', 
-                          f'Added {tokens_to_create} tokens to {username} for KES {amount} via {payment_method}')
-
-            flash(f"Successfully added {tokens_to_create} tokens to user {username} for KES {amount}.", 'success')
-            return redirect(url_for('add_token'))
-
-        except ValueError:
-            flash("Invalid amount. Please enter a valid number.", 'danger')
-        except psycopg2.Error as e:
-            flash(f"Error adding tokens: {e}", 'danger')
-        finally:
-            cur.close()
-            conn.close()
-
-    return render_template_string(add_token_html)
-
-@app.route('/change_password', methods=['GET', 'POST'])
-@limiter.limit("5 per minute")
-def change_password():
-    if 'username' not in session:
-        flash("You must be logged in to change your password.", 'danger')
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        current_password = request.form.get('current_password')
-        new_password = request.form.get('new_password')
-        confirm_password = request.form.get('confirm_password')
-
-        if not current_password or not new_password or not confirm_password:
-            flash("All fields are required.", 'danger')
-            return redirect(url_for('change_password'))
-            
-        if new_password != confirm_password:
-            flash("New passwords do not match.", 'danger')
-            return redirect(url_for('change_password'))
-
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            # Fetch the user's current password hash and salt
-            cur.execute('SELECT password_hash, salt FROM users WHERE username = %s', (session['username'],))
-            user = cur.fetchone()
-
-            if user:
-                stored_password_hash, salt = user
-
-                # Verify the current password
-                current_password_hash = hash_password(current_password, salt)
-                if current_password_hash != stored_password_hash:
-                    flash('Current password is incorrect.', 'danger')
-                    return redirect(url_for('change_password'))
-
-                # Generate a new salt and hash the new password
-                new_salt = generate_salt()
-                new_password_hash = hash_password(new_password, new_salt)
-
-                # Update the user's password hash and salt in the database
-                cur.execute('''
-                    UPDATE users
-                    SET password_hash = %s, salt = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE username = %s
-                ''', (new_password_hash, new_salt, session['username']))
-
-                # Check if a request record already exists for this user and request type
-                cur.execute('SELECT request_count FROM user_requests WHERE username = %s AND request_type = %s', 
-                            (session['username'], 'change_password'))
-                request_record = cur.fetchone()
-
-                if request_record:
-                    # Record exists, so update the request_count and requested_at
-                    cur.execute('''
-                        UPDATE user_requests
-                        SET request_count = request_count + 1, requested_at = %s
-                        WHERE username = %s AND request_type = %s
-                    ''', (datetime.now(), session['username'], 'change_password'))
-                else:
-                    # Record does not exist, so insert a new row
-                    cur.execute('''
-                        INSERT INTO user_requests (username, request_type, request_count, requested_at)
-                        VALUES (%s, %s, %s, %s)
-                    ''', (session['username'], 'change_password', 1, datetime.now()))
-
-                conn.commit()
-
-                # Log the password change
-                log_transaction(session['username'], 'change_password', 'Password changed successfully.')
-
-                flash("Password changed successfully!", 'success')
-                return redirect(url_for('dashboard'))
-
-            else:
-                flash('User not found.', 'danger')
-
-        except psycopg2.Error as e:
-            flash(f"Change password error: {e}", 'danger')
-        finally:
-            cur.close()
-            conn.close()
-
-    return render_template_string(change_password_html)
-    
-@app.route('/logout')
-def logout():
-    # Retrieve the username from the session if it's stored there
-    username = session.get('username', 'Unknown User')
-
-    # Clear the session
-    session.clear()
-
-    # Log the logout action
-    log_transaction(username, 'logout', f'User {username} logged out successfully.')
-
-    # Flash a success message
-    flash("You have been logged out successfully.", 'success')
-
-    # Redirect to the login page
-    return redirect(url_for('login'))
-
-@app.route('/find_nearest_service_provider', methods=['GET', 'POST'])
-@limiter.limit("5 per minute")
-def find_nearest_service_provider():
-    if 'username' not in session:
-        flash("You must be logged in to search for a service provider.", 'danger')
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        service_type = request.form.get('service_type')
-        user_longitude = request.form.get('longitude')
-        user_latitude = request.form.get('latitude')
-
-        # Validate inputs
-        if not service_type or not user_longitude or not user_latitude:
-            flash('All fields are required, including location access.', 'danger')
-            return redirect(url_for('find_nearest_service_provider'))
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        try:
-            # Check user token balance before allowing search
-            cur.execute('SELECT COUNT(*) FROM vouchers WHERE username = %s', (session['username'],))
-            token_count = cur.fetchone()[0]
-
-            if token_count < 1:
-                flash('Insufficient tokens. Please purchase more tokens to search for service providers.', 'danger')
-                return redirect(url_for('mpesa_payment'))
-
-            # Fetch all service providers of the requested type
-            cur.execute('''
-                SELECT phone_number, longitude, latitude 
-                FROM service_providers
-                WHERE service_type = %s;
-            ''', (service_type,))
-
-            providers = cur.fetchall()
-
-            if not providers:
-                flash(f'No {service_type} providers found.', 'warning')
-                log_transaction(session['username'], 'search_provider', f"Searched nearest {service_type}. No providers found.")
-                return redirect(url_for('find_nearest_service_provider'))
-
-            # Convert the user's input coordinates to floats
-            user_longitude = float(user_longitude)
-            user_latitude = float(user_latitude)
-
-            # Find the nearest provider using the haversine function
-            nearest_provider = None
-            nearest_distance = float('inf')
-            all_providers = []
-
-            for provider in providers:
-                phone_number, provider_longitude, provider_latitude = provider
-
-                # Calculate the distance using the haversine function
-                distance = haversine(user_longitude, user_latitude, provider_longitude, provider_latitude)
-                all_providers.append({
-                    'phone': phone_number,
-                    'distance': distance,
-                    'longitude': provider_longitude,
-                    'latitude': provider_latitude
-                })
-
-                if distance < nearest_distance:
-                    nearest_distance = distance
-                    nearest_provider = phone_number
-
-            if nearest_provider:
-                # Deduct 1 token for the successful search (changed from 2 to 1)
-                cur.execute('DELETE FROM vouchers WHERE username = %s LIMIT 1', (session['username'],))
-                
-                # Check if tokens were actually deducted
-                tokens_deducted = cur.rowcount
-                
-                if tokens_deducted == 1:
-                    flash(f'The nearest {service_type} is {nearest_distance:.2f} km away. Contact: {nearest_provider}. 1 token (KES 2) deducted.', 'success')
-                else:
-                    flash(f'The nearest {service_type} is {nearest_distance:.2f} km away. Contact: {nearest_provider}. Token deduction failed - please contact support.', 'warning')
-
-                # Store detailed results in session for display
-                session['last_search_result'] = {
-                    'service_type': service_type,
-                    'nearest_provider': nearest_provider,
-                    'distance': round(nearest_distance, 1),
-                    'token_deducted': tokens_deducted,
-                    'total_providers_found': len(providers)
-                }
-
-                # Log successful search transaction
-                log_transaction(session['username'], 'search_provider',
-                              f"Searched nearest {service_type}. Contact: {nearest_provider}, Distance: {nearest_distance:.2f} km. Found {len(providers)} providers.")
-            else:
-                flash(f'No {service_type} providers found nearby.', 'warning')
-                # Log failed search transaction
-                log_transaction(session['username'], 'search_provider', f"Searched nearest {service_type}. No providers found.")
-
-            # Increment or insert user request count for 'find_nearest_service_provider'
-            cur.execute('''
-                SELECT request_count FROM user_requests WHERE username = %s AND request_type = %s
-            ''', (session['username'], 'find_nearest_service_provider'))
-            request_record = cur.fetchone()
-
-            if request_record:
-                cur.execute('''
-                    UPDATE user_requests
-                    SET request_count = request_count + 1, requested_at = CURRENT_TIMESTAMP
-                    WHERE username = %s AND request_type = %s
-                ''', (session['username'], 'find_nearest_service_provider'))
-            else:
-                cur.execute('''
-                    INSERT INTO user_requests (username, request_type, request_count, requested_at)
-                    VALUES (%s, %s, 1, CURRENT_TIMESTAMP)
-                ''', (session['username'], 'find_nearest_service_provider'))
-
-            conn.commit()
-
-        except Exception as e:
-            flash(f"Error finding the nearest provider: {e}", 'danger')
-            log_transaction(session['username'], 'search_error', f"Error during {service_type} search: {e}")
-        finally:
-            cur.close()
-            conn.close()
-
-    # Check if we have a previous search result to display
-    search_result = session.pop('last_search_result', None)
-    
-    return render_template_string(find_nearest_service_provider_html, search_result=search_result)
-
-@app.route('/submit_service_provider', methods=['GET', 'POST'])
-@limiter.limit("5 per minute")
-def submit_service_provider():
-    if 'username' not in session:
-        flash("You must be logged in to submit your details as a new or updated service provider.", 'danger')
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        service_type = request.form.get('service_type')
-        phone_number = request.form.get('phone_number')
-        password = request.form.get('password')
-        longitude = request.form.get('longitude')
-        latitude = request.form.get('latitude')
-        location_accuracy = request.form.get('location_accuracy')
-
-        # Validate inputs
-        if not all([service_type, phone_number, password, longitude, latitude]):
-            flash('All fields are required, including location access.', 'danger')
-            return redirect(url_for('submit_service_provider'))
-
-        try:
-            # Additional input validation
-            longitude = float(longitude)
-            latitude = float(latitude)
-            accuracy = float(location_accuracy) if location_accuracy else 0
-        except ValueError:
-            flash('Invalid location values.', 'danger')
-            return redirect(url_for('submit_service_provider'))
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        try:
-            # Check user token balance
-            cur.execute('SELECT COUNT(*) FROM vouchers WHERE username = %s', (session['username'],))
-            token_count = cur.fetchone()[0]
-
-            if token_count < 1:
-                flash('Insufficient tokens. Please purchase more tokens to submit service provider details.', 'danger')
-                return redirect(url_for('mpesa_payment'))
-
-            # Check if phone number is already registered for this service type
-            cur.execute('SELECT id, password FROM service_providers WHERE phone_number = %s AND service_type = %s', 
-                        (phone_number, service_type))
-            provider = cur.fetchone()
-
-            # Generate a salt and hash the password
-            salt = generate_salt()
-            hashed_password = hash_password(password, salt)
-
-            if provider:
-                # Update existing provider details
-                cur.execute('''
-                    UPDATE service_providers 
-                    SET longitude = %s, latitude = %s, password = %s, salt = %s
-                    WHERE id = %s
-                ''', (longitude, latitude, hashed_password, salt, provider[0]))
-                action_message = 'Service provider information updated successfully.'
-                log_action = 'update_provider'
-            else:
-                # Insert new provider details
-                cur.execute('''
-                    INSERT INTO service_providers (service_type, phone_number, password, salt, longitude, latitude)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                ''', (service_type, phone_number, hashed_password, salt, longitude, latitude))
-                action_message = 'Service provider information submitted successfully.'
-                log_action = 'new_provider'
-
-            # Deduct 1 token for the service (changed from 2 to 1)
-            cur.execute('DELETE FROM vouchers WHERE username = %s LIMIT 1', (session['username'],))
-            
-            # Check if tokens were actually deducted
-            tokens_deducted = cur.rowcount
-            
-            conn.commit()
-
-            if tokens_deducted == 1:
-                flash(f'{action_message} 1 token (KES 2) deducted.', 'success')
-            else:
-                flash(f'{action_message} Token deduction failed - please contact support.', 'warning')
-
-            # Store registration details for display
-            session['last_registration'] = {
-                'service_type': service_type,
-                'phone_number': phone_number,
-                'location_accuracy': accuracy,
-                'tokens_deducted': tokens_deducted,
-                'action': 'updated' if provider else 'registered'
-            }
-
-            # Log transaction
-            log_transaction(session['username'], log_action, 
-                          f"{log_action} {service_type} with phone {phone_number}. Location accuracy: {accuracy:.0f}m")
-
-            # Increment or insert user request count for 'submit_service_provider'
-            cur.execute('''
-                SELECT request_count FROM user_requests WHERE username = %s AND request_type = %s
-            ''', (session['username'], 'submit_service_provider'))
-            request_record = cur.fetchone()
-
-            if request_record:
-                cur.execute('''
-                    UPDATE user_requests
-                    SET request_count = request_count + 1, requested_at = CURRENT_TIMESTAMP
-                    WHERE username = %s AND request_type = %s
-                ''', (session['username'], 'submit_service_provider'))
-            else:
-                cur.execute('''
-                    INSERT INTO user_requests (username, request_type, request_count, requested_at)
-                    VALUES (%s, %s, 1, CURRENT_TIMESTAMP)
-                ''', (session['username'], 'submit_service_provider'))
-
-            conn.commit()
-
-        except psycopg2.IntegrityError as e:
-            conn.rollback()
-            flash('This phone number is already registered for this service type.', 'danger')
-        except psycopg2.Error as e:
-            conn.rollback()
-            flash(f"An error occurred while submitting: {e}", 'danger')
-        finally:
-            cur.close()
-            conn.close()
-
-    # Check if we have a previous registration result to display
-    registration_result = session.pop('last_registration', None)
-    
-    return render_template_string(submit_service_provider_html, registration_result=registration_result)
-    
 @app.route("/offline")
 def offline():
     return """
@@ -1572,7 +522,8 @@ def offline():
         <p>It looks like you don't have an internet connection.</p>
         <p>Try again when you're back online.</p>
     </body></html>
-    """    
+    """
+    
 @app.route('/manifest.json')
 def manifest():
     return send_from_directory('static', 'manifest.json')
@@ -1581,675 +532,3498 @@ def manifest():
 def sw():
     return send_from_directory('static', 'service-worker.js')
     
-@app.route('/terms')
-def terms():
-    return render_template_string(terms_html)
-
-@app.route('/privacy')
+@app.route("/privacy")
+@limiter.limit("10 per hour")
 def privacy():
-    return render_template_string(privacy_html)
+    return render_template_string(PRIVACY_CONTENT)
 
-@app.route('/docs')
+@app.route("/terms")
+@limiter.limit("10 per hour")
+def terms():
+    return render_template_string(TERMS_CONTENT)
+
+@app.route("/docs")
+@limiter.limit("10  per hour")
 def docs():
-    return render_template_string(docs_html)
+    return render_template_string(DOCS_CONTENT)
     
-@app.route('/admin/vouchers')
-def admin_vouchers():
-    if 'username' not in session or session.get('role') != 'admin':
-        flash('Access denied. Admins only.', 'danger')
+
+@app.route("/logout")
+#@login_required()
+@limiter.limit("5 per hour")
+def logout():
+    session.pop('user_id', None)
+    session.pop('username', None)
+    flash("You have been logged out successfully.", "info")
+    return redirect(url_for("index"))
+    
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    # If already logged in as admin, go to dashboard (same pattern as user login)
+    if session.get('admin_id'):
+        return redirect(url_for('admin_dashboard'))
+
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+
+        # Use the same get_db_connection pattern as user login
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, username, hashed_password FROM admins WHERE username = %s",
+                (username,)
+            )
+            admin = cursor.fetchone()
+
+            # Use the helper verify_password for consistency with user login helpers
+            # Use the SAME method as user login
+            if admin and check_password_hash(admin[2], password):
+                session['admin_id'] = admin[0]
+                session['admin_username'] = admin[1]
+                #session['is_admin'] = True
+
+                response = redirect(url_for("admin_dashboard"))
+                # Same cache headers as your user login
+                response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+                response.headers['Pragma'] = 'no-cache'
+                response.headers['Expires'] = '0'
+                # You previously added frame options for admin — keep it
+                response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+                return response
+            else:
+                # Mirror user login's render_template_string signature (error + message)
+                return render_template_string(admin_login_html, error="Invalid admin credentials.", message=None)
+
+    return render_template_string(admin_login_html, error=None, message=None)
+
+@app.route("/stream")
+def stream():
+    def event_stream():
+        while True:
+            try:
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT game_code, status, timestamp, num_users, winner, winner_amount, outcome_message
+                        FROM results
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    """)
+                    game = cursor.fetchone()
+
+                    if game:
+                        data = {
+                            "game_code": game[0],
+                            "status": game[1] if game[1] else "unknown",
+                            "timestamp": game[2].strftime("%Y-%m-%d %H:%M:%S") if game[2] else "N/A",
+                            "num_users": game[3] if isinstance(game[3], int) else 0,
+                            "winner": game[4] if game[4] else "N/A",
+                            "winner_amount": float(game[5]) if isinstance(game[5], (int, float)) else 0.0,
+                            "outcome_message": game[6] if isinstance(game[6], str) else "",
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+
+                time.sleep(1)
+
+            except psycopg2.Error as e:
+                logging.error(f"Database error in streaming: {e}")
+                break
+
+            except GeneratorExit:
+                logging.info("Client disconnected from stream.")
+                break
+
+            except Exception as e:
+                logging.error(f"Unexpected error in event stream: {e}")
+                break
+
+    return Response(stream_with_context(event_stream()), content_type="text/event-stream")
+
+
+@app.route("/game_data")
+#@login_required()
+def game_data():
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # Get upcoming game
+            cursor.execute("SELECT game_code, timestamp FROM results WHERE status = 'upcoming' ORDER BY timestamp DESC LIMIT 1")
+            upcoming_game = cursor.fetchone()
+            upcoming_game_data = {
+                "game_code": upcoming_game[0] if upcoming_game else "N/A",
+                "timestamp": upcoming_game[1] if upcoming_game else "N/A",
+                "outcome_message": "Starting soon..."
+            } if upcoming_game else None
+
+            # Get in-progress game
+            cursor.execute("""
+                SELECT game_code, timestamp, num_users, total_amount, winner, winner_amount 
+                FROM results 
+                WHERE status = 'in progress' 
+                ORDER BY timestamp DESC LIMIT 1
+            """)
+            in_progress_game = cursor.fetchone()
+            in_progress_game_data = {
+                "game_code": in_progress_game[0] if in_progress_game else "N/A",
+                "timestamp": in_progress_game[1] if in_progress_game else "N/A",
+                "num_users": in_progress_game[2] if in_progress_game else 0,
+                "total_amount": float(in_progress_game[3]) if in_progress_game and in_progress_game[3] else 0.0,
+                "winner": in_progress_game[4] if in_progress_game else "N/A",
+                "winner_amount": float(in_progress_game[5]) if in_progress_game and in_progress_game[5] else 0.0,
+                "status": "in progress",
+                "outcome_message": "Game in progress"
+            } if in_progress_game else None
+
+            # Get completed games
+            cursor.execute("""
+                SELECT game_code, timestamp, num_users, total_amount, deduction, winner, winner_amount
+                FROM results
+                WHERE status = 'completed'
+                ORDER BY timestamp DESC
+                LIMIT 50
+            """)
+            completed_games = cursor.fetchall()
+
+            completed_games_data = [
+                {
+                    "game_code": game[0],
+                    "timestamp": game[1],
+                    "num_users": game[2],
+                    "total_amount": f"Ksh. {float(game[3]):.2f}" if game[3] else "Ksh. 0.00",
+                    "deduction": f"Ksh. {float(game[4]):.2f}" if game[4] else "Ksh. 0.00",
+                    "winner": game[5] if game[5] else "N/A",
+                    "winner_amount": f"Ksh. {float(game[6]):.2f}" if game[6] else "Ksh. 0.00",
+                    "outcome_message": f"Winner: {game[5]}" if game[5] else "No winner"
+                }
+                for game in completed_games
+            ]
+
+            # Check if current user is queued using your game_queue table
+            current_user_queued = False
+            if session.get('user_id'):
+                cursor.execute("SELECT COUNT(*) FROM game_queue WHERE user_id = %s", (session['user_id'],))
+                current_user_queued = cursor.fetchone()[0] > 0
+
+        response_data = {
+            "upcoming_game": upcoming_game_data or {
+                "game_code": "N/A", 
+                "timestamp": "N/A", 
+                "outcome_message": "No upcoming games"
+            },
+            "in_progress_game": in_progress_game_data,
+            "completed_games": completed_games_data,
+            "current_user_queued": current_user_queued
+        }
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        print(f"Error in game_data: {str(e)}")
+        return jsonify({
+            "error": "Unable to fetch game data",
+            "upcoming_game": {"game_code": "N/A", "timestamp": "N/A", "outcome_message": "Error loading"},
+            "completed_games": [],
+            "current_user_queued": False
+        }), 500
+
+@app.route("/play", methods=["POST"])
+#@login_required()
+@limiter.limit("10 per minute")  # More generous limit
+def play():
+    user_id = session.get("user_id")
+    username = session.get("username")
+    
+    if not user_id:
+        return jsonify({"success": False, "error": "You must be logged in to play."})
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # Check if user already in queue
+            cursor.execute("SELECT 1 FROM game_queue WHERE user_id = %s", (user_id,))
+            if cursor.fetchone():
+                return jsonify({"success": False, "error": "Already enrolled in current game!"})
+
+            # Check current balance
+            cursor.execute("SELECT wallet FROM users WHERE id = %s", (user_id,))
+            result = cursor.fetchone()
+            current_balance = float(result[0]) if result and result[0] else 0.0
+            
+            if current_balance < 1.0:
+                return jsonify({"success": False, "error": f"Insufficient funds! Your balance: Ksh. {current_balance:.2f}"})
+
+            # Deduct play amount atomically
+            cursor.execute("""
+                UPDATE users 
+                SET wallet = wallet - 1.0 
+                WHERE id = %s AND wallet >= 1.0
+                RETURNING wallet
+            """, (user_id,))
+            
+            updated = cursor.fetchone()
+            if not updated:
+                return jsonify({"success": False, "error": "Transaction failed. Please try again."})
+
+            # Record transaction
+            cursor.execute("""
+                INSERT INTO transactions (user_id, type, amount, timestamp)
+                VALUES (%s, 'game_entry', %s, %s)
+            """, (user_id, -1.0, get_timestamp()))
+
+            # Add to game queue
+            cursor.execute("""
+                INSERT INTO game_queue (user_id, timestamp)
+                VALUES (%s, %s)
+            """, (user_id, get_timestamp()))
+
+            # Get updated balance
+            new_balance = float(updated[0])
+            
+            conn.commit()
+
+            # Log successful play
+            logging.info(f"User {username} successfully enrolled in game. New balance: Ksh. {new_balance:.2f}")
+
+            return jsonify({
+                "success": True, 
+                "message": "🎉 Successfully enrolled in the next game!",
+                "new_balance": new_balance
+            })
+
+    except psycopg2.IntegrityError:
+        return jsonify({"success": False, "error": "Already enrolled in current game!"})
+    except Exception as e:
+        logging.error(f"Play error for user {username}: {str(e)}")
+        return jsonify({"success": False, "error": "System error. Please try again."})
+
+@app.route("/admin/add_allowed_user", methods=["POST"])
+#@login_required(role='admin')
+@limiter.limit("50 per hour")
+def admin_add_allowed_user():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login", error="Unauthorized access."))
+
+    username = request.form.get("allowed_username")
+
+    if not username:
+        return redirect(url_for("admin_dashboard", error="Username is required."))
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO allowed_users (username) VALUES (%s) ON CONFLICT DO NOTHING",
+                (username,)
+            )
+            conn.commit()
+            return redirect(url_for("admin_dashboard", message="Allowed username added successfully."))
+        except Exception as e:
+            logging.error(f"Error adding allowed user: {e}")
+            return redirect(url_for("admin_dashboard", error="Failed to add allowed username."))
+
+@app.route("/admin/dashboard")
+#@login_required(role='admin')
+@limiter.limit("5 per hour")
+def admin_dashboard():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login", error="Please log in as an admin."))
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users ORDER BY id ASC")
+        users = cursor.fetchall()
+
+        cursor.execute("SELECT * FROM user_activity ORDER BY timestamp DESC LIMIT 100")
+        logs = cursor.fetchall()
+
+    return render_template_string(
+        admin_html,
+        users=users,
+        logs=logs,
+        error=request.args.get("error"),
+        message=request.args.get("message")
+    )  
+        
+@app.route("/admin/visitor_log")
+#@login_required(role='admin')
+@limiter.limit("5 per hour")
+def view_visits():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login", error="Unauthorized access."))
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ip_address, user_agent, referrer, path, timestamp
+            FROM visit_logs
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """)
+        logs = cursor.fetchall()
+
+    return render_template_string("""
+    <h2>Recent Site Visits</h2>
+    <table border="1" cellpadding="5">
+        <tr><th>IP Address</th><th>User Agent</th><th>Referrer</th><th>Path</th><th>Time</th></tr>
+        {% for log in logs %}
+            <tr>
+                <td>{{ log[0] }}</td>
+                <td>{{ log[1] }}</td>
+                <td>{{ log[2] }}</td>
+                <td>{{ log[3] }}</td>
+                <td>{{ log[4] }}</td>
+            </tr>
+        {% endfor %}
+    </table>
+    <br>
+    <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
+    """, logs=logs)
+
+@app.route("/admin/logout")
+#@login_required(role='admin')
+@limiter.limit("3 per hour")
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
+    
+@app.route('/robots.txt')
+def robots_txt():
+    return (
+        "User-agent: *\nDisallow:\n",
+        200,
+        {'Content-Type': 'text/plain'}
+    )
+
+#OLD CODE
+@app.route("/admin/update_wallet", methods=["POST"])
+#@@login_required(role='admin')
+@limiter.limit("50 per hour")
+def admin_update_wallet():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login", error="Unauthorized access."))
+
+    user_id = request.form.get("user_id")
+    amount = request.form.get("amount")
+    action = request.form.get("action")
+
+    try:
+        amount = float(amount)
+        if action not in ["deposit", "withdraw"]:
+            return redirect(url_for("admin_dashboard", error="Invalid action."))
+
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            if not cursor.fetchone():
+                return redirect(url_for("admin_dashboard", error="User not found."))
+
+            if action == "deposit":
+                update_wallet(user_id, amount)
+                log_transaction(user_id, "deposit", amount)
+
+            elif action == "withdraw":
+                wallet_balance = get_wallet_balance(user_id)
+                if wallet_balance is None or wallet_balance < amount:
+                    return redirect(url_for("admin_dashboard", error="Insufficient balance for withdrawal."))
+
+                update_wallet(user_id, -amount)
+                log_transaction(user_id, "withdrawal", amount)
+
+        return redirect(url_for("admin_dashboard", message="Wallet updated successfully."))
+
+    except ValueError:
+        return redirect(url_for("admin_dashboard", error="Invalid amount. Please enter a valid number."))
+        
+###########
+@app.route("/cashbook")
+#@login_required(role='admin')
+@limiter.limit("5 per hour")
+def cashbook():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login", error="Unauthorized access."))
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # 1. Total Gross Profit (ALWAYS POSITIVE) - Simple query only
+            cursor.execute("""
+                SELECT COALESCE(SUM(deduction), 0) 
+                FROM results 
+                WHERE status = 'completed' AND deduction > 0
+            """)
+            result = cursor.fetchone()
+            total_gross_profit = float(result[0]) if result and result[0] is not None else 0.0
+            total_gross_profit = max(0.0, total_gross_profit)  # Ensure no negative
+            
+            # 2. Total Profitable Games Count
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM results 
+                WHERE status = 'completed' AND deduction > 0
+            """)
+            result = cursor.fetchone()
+            total_profitable_games = int(result[0]) if result and result[0] is not None else 0
+            
+            # 3. Recent Profit Transactions (Last 5 only)
+            cursor.execute("""
+                SELECT 
+                    game_code,
+                    timestamp,
+                    num_users,
+                    total_amount,
+                    deduction
+                FROM results 
+                WHERE status = 'completed'
+                AND deduction > 0
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """)
+            recent_profits = cursor.fetchall()
+            
+            # Convert to safe data types
+            safe_recent_profits = []
+            for profit in recent_profits:
+                safe_recent_profits.append((
+                    str(profit[0]) if profit[0] else "N/A",
+                    profit[1] if profit[1] else "N/A",
+                    int(profit[2]) if profit[2] is not None else 0,
+                    float(profit[3]) if profit[3] is not None else 0.0,
+                    float(profit[4]) if profit[4] is not None else 0.0
+                ))
+        
+        cashbook_data = {
+            "total_gross_profit": total_gross_profit,
+            "total_profitable_games": total_profitable_games,
+            "recent_profits": safe_recent_profits
+        }
+        
+        return render_template_string(cashbook_html, data=cashbook_data)
+        
+    except Exception as e:
+        logging.error(f"Cashbook error: {e}")
+        # Return safe default data on error
+        cashbook_data = {
+            "total_gross_profit": 0.0,
+            "total_profitable_games": 0,
+            "recent_profits": []
+        }
+        return render_template_string(cashbook_html, data=cashbook_data)
+        
+###############        
+@app.route("/withdraw", methods=["GET", "POST"])
+#@login_required()
+@limiter.limit("3 per hour")
+def withdraw():
+    if not session.get('user_id'):
         return redirect(url_for('login'))
     
-    conn = get_db_connection()
-    cur = conn.cursor()
+    user_id = session['user_id']
+    username = session.get('username')
     
-    # Get search parameters
-    username_filter = request.args.get('username', '')
-    show_used = request.args.get('show_used', 'false') == 'true'
-    show_expired = request.args.get('show_expired', 'false') == 'true'
-    
-    # Build query
-    if show_used:
-        query = '''
-            SELECT v.code, v.username, v.created_at, v.created_by, v.valid_until,
-                   uv.used_at, uv.username as used_by
-            FROM vouchers v
-            LEFT JOIN used_vouchers uv ON v.code = uv.code
-            WHERE 1=1
-        '''
-    else:
-        query = '''
-            SELECT code, username, created_at, created_by, valid_until,
-                   NULL as used_at, NULL as used_by
-            FROM vouchers 
-            WHERE 1=1
-        '''
-    
-    params = []
-    
-    if username_filter:
-        query += ' AND v.username = %s' if show_used else ' AND username = %s'
-        params.append(username_filter)
-    
-    if not show_used:
-        query += ' AND NOT EXISTS (SELECT 1 FROM used_vouchers uv WHERE uv.code = vouchers.code)'
-    
-    if not show_expired:
-        query += ' AND valid_until > NOW()'
-    
-    query += ' ORDER BY created_at DESC'
-    
-    cur.execute(query, params)
-    vouchers = cur.fetchall()
-    
-    # Get statistics
-    cur.execute('''
-        SELECT 
-            COUNT(*) as total_vouchers,
-            COUNT(CASE WHEN valid_until > NOW() THEN 1 END) as valid_vouchers,
-            COUNT(CASE WHEN valid_until <= NOW() THEN 1 END) as expired_vouchers,
-            (SELECT COUNT(*) FROM used_vouchers) as used_vouchers
-        FROM vouchers
-    ''')
-    stats = cur.fetchone()
-    
-    cur.close()
-    conn.close()
-    
-    # FIX: Add this line to provide 'now' to the template
-    from datetime import datetime
-    now = datetime.now()
-    
-    return render_template_string(admin_vouchers_html, 
-                                vouchers=vouchers, 
-                                username_filter=username_filter,
-                                show_used=show_used,
-                                show_expired=show_expired,
-                                stats=stats,
-                                now=now)  # This fixes the 'now is undefined' error
+    # Check if user is suspended
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT suspension_end, reason 
+            FROM user_suspensions 
+            WHERE user_id = %s AND suspension_end > CURRENT_TIMESTAMP
+            ORDER BY suspended_at DESC LIMIT 1
+        """, (user_id,))
+        suspension = cursor.fetchone()
+        
+        if suspension:
+            suspension_end = suspension[0]
+            reason = suspension[1]
+            return render_template_string(withdraw_html, 
+                error=f"Account suspended until {suspension_end}. Reason: {reason}",
+                can_withdraw=False)
 
-@app.route('/admin/vouchers/export')
-def export_vouchers():
-    if 'username' not in session or session.get('role') != 'admin':
-        return "Unauthorized", 403
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    username_filter = request.args.get('username', '')
-    
-    query = '''
-        SELECT username, code, created_at, created_by, valid_until
-        FROM vouchers 
-        WHERE 1=1
-    '''
-    params = []
-    
-    if username_filter:
-        query += ' AND username = %s'
-        params.append(username_filter)
-    
-    query += ' ORDER BY username, created_at'
-    
-    cur.execute(query, params)
-    vouchers = cur.fetchall()
-    
-    cur.close()
-    conn.close()
-    
-    # Create CSV
-    
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['Phone Number', 'Voucher Code', 'Created At', 'Created By', 'Valid Until'])
-    
-    for voucher in vouchers:
-        writer.writerow(voucher)
-    
-    from flask import make_response
-    response = make_response(output.getvalue())
-    response.headers["Content-Disposition"] = "attachment; filename=vouchers.csv"
-    response.headers["Content-type"] = "text/csv"
-    return response
+    if request.method == "POST":
+        try:
+            amount = float(request.form.get('amount', 0))
+            
+            # Validation checks
+            if amount < 100:
+                return render_template_string(withdraw_html, 
+                    error="Minimum withdrawal amount is KES 100",
+                    can_withdraw=True)
+            
+            if amount > 50000:
+                return render_template_string(withdraw_html, 
+                    error="Maximum withdrawal amount is KES 50,000",
+                    can_withdraw=True)
 
-@app.route('/admin/vouchers/delete_expired', methods=['POST'])
-def delete_expired_vouchers():
-    if 'username' not in session or session.get('role') != 'admin':
-        flash('Access denied. Admins only.', 'danger')
+            # Calculate withdrawal fee
+            cursor.execute("""
+                SELECT fee_amount 
+                FROM withdrawal_fees 
+                WHERE %s BETWEEN min_amount AND COALESCE(max_amount, 999999)
+                AND is_active = TRUE
+                ORDER BY min_amount
+                LIMIT 1
+            """, (amount,))
+            fee_result = cursor.fetchone()
+            withdrawal_fee = fee_result[0] if fee_result else 10
+            net_amount = amount - withdrawal_fee
+
+            # Check wallet balance from wins only
+            cursor.execute("""
+                SELECT COALESCE(SUM(amount), 0) 
+                FROM win_earnings 
+                WHERE user_id = %s AND is_withdrawn = FALSE
+            """, (user_id,))
+            available_balance = cursor.fetchone()[0]
+            
+            if amount > available_balance:
+                return render_template_string(withdraw_html, 
+                    error=f"Insufficient win earnings. Available: KES {available_balance:.2f}",
+                    can_withdraw=True)
+            
+            # Check 24-hour withdrawal limit
+            cursor.execute("""
+                SELECT last_withdrawal_time 
+                FROM withdrawal_limits 
+                WHERE user_id = %s
+            """, (user_id,))
+            limit_data = cursor.fetchone()
+            
+            if limit_data and limit_data[0]:
+                last_withdrawal = limit_data[0]
+                time_since_last = datetime.now() - last_withdrawal
+                if time_since_last.total_seconds() < 86400:
+                    return render_template_string(withdraw_html, 
+                        error="You can only withdraw once every 24 hours",
+                        can_withdraw=True)
+            
+            # Check daily attempts
+            cursor.execute("""
+                SELECT daily_attempts, last_attempt_time 
+                FROM withdrawal_limits 
+                WHERE user_id = %s
+            """, (user_id,))
+            attempt_data = cursor.fetchone()
+            
+            current_time = datetime.now()
+            if attempt_data:
+                daily_attempts = attempt_data[0]
+                last_attempt = attempt_data[1]
+                
+                if last_attempt and last_attempt.date() < current_time.date():
+                    daily_attempts = 0
+                
+                if daily_attempts >= 5:
+                    suspension_end = current_time + timedelta(hours=6)
+                    cursor.execute("""
+                        INSERT INTO user_suspensions (user_id, reason, suspension_end, suspended_by)
+                        VALUES (%s, %s, %s, %s)
+                    """, (user_id, "Excessive withdrawal attempts", suspension_end, 1))
+                    
+                    cursor.execute("""
+                        UPDATE withdrawal_limits 
+                        SET daily_attempts = 0 
+                        WHERE user_id = %s
+                    """, (user_id,))
+                    
+                    conn.commit()
+                    return render_template_string(withdraw_html, 
+                        error="Account suspended for 6 hours due to excessive attempts",
+                        can_withdraw=False)
+            
+            # Generate receipt code
+            receipt_code = f"WDL{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id}"
+            
+            # Create withdrawal request
+            cursor.execute("""
+                INSERT INTO withdrawal_requests 
+                (user_id, username, requested_amount, withdrawal_fee, net_amount, receipt_code)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (user_id, username, amount, withdrawal_fee, net_amount, receipt_code))
+            
+            # Update withdrawal limits
+            if attempt_data:
+                cursor.execute("""
+                    UPDATE withdrawal_limits 
+                    SET daily_attempts = daily_attempts + 1, last_attempt_time = %s
+                    WHERE user_id = %s
+                """, (current_time, user_id))
+            else:
+                cursor.execute("""
+                    INSERT INTO withdrawal_limits (user_id, daily_attempts, last_attempt_time)
+                    VALUES (%s, 1, %s)
+                """, (user_id, current_time))
+            
+            conn.commit()
+            
+            # Show receipt page
+            return redirect(url_for('withdrawal_receipt', receipt_code=receipt_code))
+            
+        except ValueError:
+            return render_template_string(withdraw_html, 
+                error="Invalid amount format",
+                can_withdraw=True)
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Withdrawal error: {e}")
+            return render_template_string(withdraw_html, 
+                error="System error. Please try again later.",
+                can_withdraw=True)
+    
+    # GET request - show withdrawal form
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COALESCE(SUM(amount), 0) 
+            FROM win_earnings 
+            WHERE user_id = %s AND is_withdrawn = FALSE
+        """, (user_id,))
+        available_balance = cursor.fetchone()[0]
+        
+        cursor.execute("""
+            SELECT last_withdrawal_time 
+            FROM withdrawal_limits 
+            WHERE user_id = %s
+        """, (user_id,))
+        limit_data = cursor.fetchone()
+        
+        can_withdraw_again = True
+        if limit_data and limit_data[0]:
+            time_since_last = datetime.now() - limit_data[0]
+            if time_since_last.total_seconds() < 86400:
+                can_withdraw_again = False
+    
+    return render_template_string(withdraw_html, 
+        available_balance=available_balance,
+        can_withdraw=can_withdraw_again,
+        last_withdrawal=limit_data[0] if limit_data else None)
+        
+
+@app.route("/withdrawal_receipt/<receipt_code>")
+def withdrawal_receipt(receipt_code):
+    if not session.get('user_id'):
         return redirect(url_for('login'))
     
-    conn = get_db_connection()
-    cur = conn.cursor()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM withdrawal_requests 
+            WHERE receipt_code = %s AND user_id = %s
+        """, (receipt_code, session['user_id']))
+        withdrawal = cursor.fetchone()
+        
+        if not withdrawal:
+            return redirect(url_for('index', error="Receipt not found"))
     
-    cur.execute('DELETE FROM vouchers WHERE valid_until <= NOW()')
-    deleted_count = cur.rowcount
+    return render_template_string(withdrawal_receipt_html, withdrawal=withdrawal)
     
-    conn.commit()
-    cur.close()
-    conn.close()
+@app.route("/admin/withdrawals")
+#@login_required(role='admin')
+@limiter.limit("50 per hour")
+def admin_withdrawals():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login", error="Unauthorized access."))
     
-    flash(f'Deleted {deleted_count} expired vouchers', 'success')
-    return redirect(url_for('admin_vouchers'))    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT wr.*, u.email
+            FROM withdrawal_requests wr
+            JOIN users u ON wr.user_id = u.id
+            ORDER BY wr.request_time DESC
+            LIMIT 100
+        """)
+        withdrawals = cursor.fetchall()
+        
+        cursor.execute("SELECT COUNT(*) FROM withdrawal_requests WHERE status = 'pending'")
+        pending_count = cursor.fetchone()[0]
     
+    return render_template_string(admin_withdrawals_html, 
+        withdrawals=withdrawals, 
+        pending_count=pending_count)
 
-index_html = """<!DOCTYPE html>
-<html lang="en">  
-<head>
-  <meta charset="UTF-8" />  
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>  
-  <title>Mashamba na Nyumba Portals</title>    
-  <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" type="image/x-icon" />  
-  <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}" />  
-  <meta name="theme-color" content="#1e88e5" />    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />  <style>  
-    body {  
-        font-family: Arial, sans-serif;  
-        margin: 0;  
-        padding: 0;  
-        background-color: #f4f6f9;  
-        color: #333333;  
-        text-align: center;  
-    }  
-    .container {  
-        min-height: 100vh;  
-        display: flex;  
-        flex-direction: column;  
-    }  
-    .header {  
-        padding: 20px;  
-        background-color: #1e88e5;  
-        color: #ffffff;  
-    }  
-    .header img {  
-        max-width: 100px;  
-        height: auto;  
-        display: block;  
-        margin: 0 auto 10px;  
-    }  
-    .header h1 {  
-        margin: 0;  
-        font-size: 2.5em;  
-    }  
-    .telephone {  
-        margin-top: 10px;  
-        font-size: 1.2em;  
-        color: #e3f2fd;  
-        display: flex;  
-        justify-content: center;  
-        align-items: center;  
-        gap: 8px;  
-    }  
-    .telephone i {  
-        font-size: 1.3em;  
-    }
-    .content {  
-        padding: 30px 20px;  
-        flex: 1;  
-    }  
-    .content p {  
-        font-size: 1.3em;  
-        color: #555555;  
-        margin-bottom: 20px;  
-    }
-    .account-heading {
-    color: #000000; /* black */
-    font-size: 1.8em;
-    font-weight: bold;
-    text-shadow: 2px 2px 4px rgba(0,0,0,0.15); /* soft shadow for depth */
-    letter-spacing: 1px;
-    margin-bottom: 10px;
-    }
-    .content a {  
-        display: inline-block;  
-        padding: 12px 24px;  
-        margin: 10px;  
-        color: #ffffff;  
-        background-color: #43a047;  
-        text-decoration: none;  
-        border-radius: 6px;  
-        font-size: 1.1em;  
-        transition: background-color 0.3s ease;  
-    }  
-    .content a:hover {  
-        background-color: #2e7d32;  
-    }
-    .harambee-banner {
-      background: linear-gradient(to right, #006400, #008080);
-      border-radius: 16px;
-      margin: 40px auto;
-      max-width: 800px;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-      padding: 60px 20px;
-      }
-
-    .harambee-logo {
-      max-width: 120px;
-      height: auto;
-      border-radius: 12px;
-      box-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
-      }    
-#installBtn {
-    display: block;
-    margin: 20px auto;
-    padding: 10px 20px; /* reduce left/right padding */
-    width: auto; /* remove width override */
-    background-color: #ff9800;
-    color: white;
-    font-weight: bold;
-    font-size: 1em;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    box-shadow: 0 3px 6px rgba(0,0,0,0.15);
-    transition: background-color 0.3s ease;
-}
-#installBtn:hover {
-    background-color: #f57c00;
-} 
-    .footer {  
-        background-color: #0d47a1;  
-        color: #ffffff;  
-        padding: 15px;  
-        font-size: 0.95em;  
-    }  
-    .flash-messages {  
-        list-style-type: none;  
-        padding: 0;  
-        margin: 20px auto;  
-        max-width: 600px;  
-    }  
-    .flash-messages li {  
-        background-color: #fff3cd;  
-        color: #856404;  
-        border: 1px solid #ffeeba;  
-        border-radius: 5px;  
-        padding: 10px;  
-        margin: 10px 0;  
-    }  
-    .socials {  
-        margin: 15px 0;  
-    }  
-    .socials a {  
-        margin: 0 15px;  
-        text-decoration: none;  
-        display: inline-flex;  
-        align-items: center;  
-        justify-content: center;  
-        width: 45px;  
-        height: 45px;  
-        border-radius: 50%;  
-        background-color: white;  
-        transition: transform 0.3s ease;  
-    }  
-    .socials a:hover {  
-        transform: scale(1.1);  
-    }  
-    .socials img {  
-        width: 24px;  
-        height: 24px;  
-        vertical-align: middle;  
-    }  
-    .phone-icon {  
-        display: inline-block;  
-        width: 24px;  
-        height: 24px;  
-        background-color: #25D366;  
-        mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z'/%3E%3C/svg%3E") no-repeat center;  
-        -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z'/%3E%3C/svg%3E") no-repeat center;  
-    }
-    #timestamp-display {  
-        margin-top: 15px;  
-        font-size: 1em;  
-        color: #555;  
-        padding: 10px;  
-        background-color: #e3f2fd;  
-        border-radius: 5px;  
-        display: inline-block;  
-    }  
-    .install-explainer {  
-        margin-top: 15px;  
-        font-size: 0.9em;  
-        color: #666;  
-        max-width: 500px;  
-        margin-left: auto;  
-        margin-right: auto;  
-    }  
-</style>
-
-<script>  
-  let deferredPrompt;  
-  
-  window.addEventListener('beforeinstallprompt', (e) => {  
-    e.preventDefault();  
-    deferredPrompt = e;  
-  
-    // Check location permission before showing install button  
-    navigator.permissions.query({name: 'geolocation'}).then((permissionStatus) => {  
-      if (permissionStatus.state === 'granted' || permissionStatus.state === 'prompt') {  
-        document.getElementById('installBtn').style.display = 'block';  
-      } else {  
-        deferredPrompt = null; // Cancel installation  
-      }  
-    }).catch(() => {  
-      deferredPrompt = null; // Cancel on error or unsupported  
-    });  
-  });  
-  
-  document.addEventListener('DOMContentLoaded', function () {  
-    const installBtn = document.getElementById('installBtn');  
-  
-    installBtn.addEventListener('click', async () => {  
-      try {  
-        const permission = await navigator.permissions.query({name: 'geolocation'});  
-        if (permission.state === 'denied') {  
-          alert('Location permission denied. Installation is cancelled.');  
-          deferredPrompt = null;  
-          installBtn.style.display = 'none';  
-          return;  
-        }  
-  
-        navigator.geolocation.getCurrentPosition(  
-          async () => {  
-            if (deferredPrompt) {  
-              deferredPrompt.prompt();  
-              const { outcome } = await deferredPrompt.userChoice;  
-              if (outcome === 'accepted') {  
-                console.log('User accepted install');  
-              } else {  
-                console.log('User dismissed install');  
-              }  
-              deferredPrompt = null;  
-            }  
-          },  
-          (error) => {  
-            alert('Location access required to install. Installation cancelled.');  
-            deferredPrompt = null;  
-            installBtn.style.display = 'none';  
-          }  
-        );  
-      } catch (err) {  
-        alert('Unable to verify location permission. Installation cancelled.');  
-        deferredPrompt = null;  
-        installBtn.style.display = 'none';  
-      }  
-    });  
-  });  
-</script>
-
-</head>  
-<body>    <div class="header">  
-    <img src="{{ url_for('static', filename='mashamba.png') }}" alt="Mashamba na Nyumba Logo">  
-    <button id="installBtn" style="display: none;">Install App</button>
-    <p id="locationNotice" style="background-color: black; color: white; font-size: 14px; padding: 10px; border-radius: 5px; margin-top: 10px;">
-      This app uses geolocation. Your location will be used to determine the distance between you and the other client.
-    </p>           
-                                 
-    {% with messages = get_flashed_messages(with_categories=true) %}  
-    {% if messages %}  
-    <ul class="flash-messages">  
-        {% for category, message in messages %}  
-        <li class="{{ category }}">{{ message }}</li>  
-        {% endfor %}  
-    </ul>  
-    {% endif %}  
-    {% endwith %}  
-      
-    <!-- Mashamba na Nyumba-->
-    <div class="soko-banner bg-gradient-to-r from-green-600 via-emerald-500 to-lime-500 text-white p-6 rounded-xl shadow-lg mb-6">
-      <h1 class="text-4xl font-bold mb-2">Welcome to Mashamba na Nyumba Portal</h1>
-      <p class="text-lg mb-4">Your trusted proximity-based service marketplace</p>
-
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm md:text-base">
-        <div class="bg-white bg-opacity-10 p-4 rounded-lg border border-white border-opacity-20">
-          <h2 class="font-semibold text-lg mb-1">👨‍🔧 Service Providers</h2>
-          <p>Register, get listed, and connect with nearby clients using token units.</p>
-        </div>
-
-        <div class="bg-white bg-opacity-10 p-4 rounded-lg border border-white border-opacity-20">
-          <h2 class="font-semibold text-lg mb-1">🧑‍💼 Clients</h2>
-          <p>Search nearby providers, filter by category or location, and unlock contact details.</p>
-        </div>
-    </div>        
-
-        <div class="bg-white bg-opacity-10 p-4 rounded-lg border border-white border-opacity-20">
-          <h2 class="font-semibold text-lg mb-1">🛡️ Admin Panel</h2>
-          <p>Secure portal for managing users, tokens, and platform settings.</p>
-        </div>
-      </div>
-                                 
-    <div class="content">  
-        <p>ACCOUNT MANAGEMENT</p>  
-          
-        <a href="{{ url_for('register') }}">Register</a>  
-        <a href="{{ url_for('login') }}">Login</a>  
-    </div>      
-    <div class="footer">    
-        <p>  
-            <a href="/terms" style="color:white">Terms & Conditions</a> |   
-            <a href="/privacy" style="color:white">Privacy Policy</a> |   
-            <a href="/docs" style="color:white">Documentation</a>  
-        </p>    
-        <div class="socials">    
-            <a href="https://m.facebook.com/jamesboyid.ochuna" target="_blank" title="Facebook">    
-                <img src="https://upload.wikimedia.org/wikipedia/commons/5/51/Facebook_f_logo_%282019%29.svg" alt="Facebook">    
-            </a>    
-            <a href="https://wa.me/254701207062" target="_blank" title="WhatsApp">    
-                <img src="https://upload.wikimedia.org/wikipedia/commons/6/6b/WhatsApp.svg" alt="WhatsApp">    
-            </a>    
-            <a href="tel:+254701207062" title="Call Us">    
-                <span class="phone-icon"></span>  
-            </a>    
-        </div>  
-        <p>&copy; Pigasimu 2025. All rights reserved.</p>    
-    </div>    
-</div>
-
-    <div class="harambee-banner text-center py-5">
-       <img src="/static/piclog.png" alt="Harambee Cash Logo" class="harambee-logo mb-4" />
-      <h2 class="display-5 fw-bold text-white">Visit Our Partner Platform</h2>
-      <p class="lead text-light mb-4">Experience the digita fast, secure, honest mobile harambee fund raiser and auto random disburser on <strong>Harambee Cash App</strong>.</p>
-      <a href="https://harambeecash.pigasimu.co.ke" class="btn btn-light btn-lg px-4 rounded-pill fw-bold" target="_blank">
-        Go to Harambee Cash
-      </a>
-    </div>
+@app.route("/admin/process_withdrawal", methods=["POST"])
+#@login_required(role='admin')
+@limiter.limit("50 per hour")
+def process_withdrawal():
+    if not session.get("is_admin"):
+        return jsonify({"error": "Unauthorized"}), 403
     
-  <script>  
-    if ('serviceWorker' in navigator) {  
-      navigator.serviceWorker.register('{{ url_for("static", filename="service-worker.js") }}')  
-        .then(reg => console.log('Service Worker registered:', reg))  
-        .catch(err => console.log('Service Worker registration failed:', err));  
-    }  
-  
-    let deferredPrompt;  
-    const installBtn = document.getElementById("installBtn");  
-  
-    window.addEventListener("beforeinstallprompt", (e) => {  
-      e.preventDefault();  
-      deferredPrompt = e;  
-      installBtn.style.display = "inline-block";  
-    });  
-  
-    installBtn.addEventListener("click", async () => {  
-      if (deferredPrompt) {  
-        deferredPrompt.prompt();  
-        const { outcome } = await deferredPrompt.userChoice;  
-        if (outcome === "accepted") {  
-          installBtn.style.display = "none";  
-        }  
-        deferredPrompt = null;  
-      }  
-    });  
-  </script>  </body>  
-</html>  
-"""
+    withdrawal_id = request.form.get("withdrawal_id")
+    action = request.form.get("action")
+    admin_notes = request.form.get("admin_notes", "")
+    
+    if not withdrawal_id or not action:
+        return jsonify({"error": "Missing parameters"}), 400
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT user_id, requested_amount, status 
+                FROM withdrawal_requests 
+                WHERE id = %s
+            """, (withdrawal_id,))
+            withdrawal = cursor.fetchone()
+            
+            if not withdrawal:
+                return jsonify({"error": "Withdrawal not found"}), 404
+            
+            user_id, amount, current_status = withdrawal
+            
+            if current_status != 'pending':
+                return jsonify({"error": "Withdrawal already processed"}), 400
+            
+            admin_id = session.get("admin_id")
+            processed_time = datetime.now()
+            
+            if action == 'approve':
+                # Check win earnings balance
+                cursor.execute("""
+                    SELECT COALESCE(SUM(amount), 0) 
+                    FROM win_earnings 
+                    WHERE user_id = %s AND is_withdrawn = FALSE
+                """, (user_id,))
+                available_balance = cursor.fetchone()[0]
+                
+                if amount > available_balance:
+                    return jsonify({"error": "Insufficient win earnings"}), 400
+                
+                # Mark earnings as withdrawn
+                cursor.execute("""
+                    UPDATE win_earnings 
+                    SET is_withdrawn = TRUE, withdrawn_at = %s
+                    WHERE user_id = %s AND is_withdrawn = FALSE
+                """, (processed_time, user_id))
+                
+                # Update withdrawal request
+                cursor.execute("""
+                    UPDATE withdrawal_requests 
+                    SET status = 'completed', processed_time = %s, 
+                        processed_by = %s, admin_notes = %s
+                    WHERE id = %s
+                """, (processed_time, admin_id, admin_notes, withdrawal_id))
+                
+                # Update withdrawal limit
+                cursor.execute("""
+                    UPDATE withdrawal_limits 
+                    SET last_withdrawal_time = %s 
+                    WHERE user_id = %s
+                """, (processed_time, user_id))
+                
+            elif action == 'reject':
+                cursor.execute("""
+                    UPDATE withdrawal_requests 
+                    SET status = 'rejected', processed_time = %s, 
+                        processed_by = %s, admin_notes = %s
+                    WHERE id = %s
+                """, (processed_time, admin_id, admin_notes, withdrawal_id))
+            
+            conn.commit()
+            return jsonify({"success": True, "message": f"Withdrawal {action}ed"})
+            
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Process withdrawal error: {e}")
+        return jsonify({"error": "System error"}), 500
+        
+@app.route("/deposit", methods=["GET", "POST"])
+#@login_required()
+@limiter.limit("5 per hour")
+def deposit():
+    if not session.get('user_id'):
+        return redirect(url_for('login'))
+    
+    user_id = session['user_id']
+    username = session.get('username')
+    
+    if request.method == "POST":
+        try:
+            amount = float(request.form.get('amount', 0))
+            
+            # Validation
+            if amount < 50:
+                return render_template_string(deposit_html, 
+                    error="Minimum deposit amount is KES 50",
+                    can_deposit=True)
+            
+            if amount > 50000:
+                return render_template_string(deposit_html, 
+                    error="Maximum deposit amount is KES 50,000",
+                    can_deposit=True)
 
-upload_media_html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Upload Media</title>
-    <style>
-        body { font-family: Arial; max-width: 500px; margin: 50px auto; padding: 20px; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; }
-        input, textarea { width: 100%; padding: 8px; }
-        button { background: #007bff; color: white; padding: 10px 20px; border: none; cursor: pointer; }
-    </style>
-</head>
-<body>
-    <h1>Upload Media</h1>
-    <form method="POST" enctype="multipart/form-data">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <div class="form-group">
-            <label>Title:</label>
-            <input type="text" name="title" required>
-        </div>
-        <div class="form-group">
-            <label>Description:</label>
-            <textarea name="content"></textarea>
-        </div>
-        <div class="form-group">
-            <label>Media File:</label>
-            <input type="file" name="media_file" accept="image/*,video/*" required>
-        </div>
-        <button type="submit">Upload</button>
-    </form>
-    <a href="{{ url_for('dashboard') }}">Back to Dashboard</a>
-</body>
-</html>
-"""
+            # Generate deposit voucher
+            voucher_code = f"DPT{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id}"
+            
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Create deposit request
+                cursor.execute("""
+                    INSERT INTO deposit_requests 
+                    (user_id, username, amount, voucher_code, status)
+                    VALUES (%s, %s, %s, %s, 'pending')
+                """, (user_id, username, amount, voucher_code))
+                
+                conn.commit()
+            
+            # Redirect to voucher page
+            return redirect(url_for('deposit_voucher', voucher_code=voucher_code))
+            
+        except ValueError:
+            return render_template_string(deposit_html, 
+                error="Invalid amount format",
+                can_deposit=True)
+        except Exception as e:
+            logging.error(f"Deposit request error: {e}")
+            return render_template_string(deposit_html, 
+                error="System error. Please try again.",
+                can_deposit=True)
+    
+    # GET request - show deposit form
+    return render_template_string(deposit_html, can_deposit=True)
 
-mpesa_payment_html = """
+@app.route("/deposit_voucher/<voucher_code>")
+def deposit_voucher(voucher_code):
+    if not session.get('user_id'):
+        return redirect(url_for('login'))
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM deposit_requests 
+            WHERE voucher_code = %s AND user_id = %s
+        """, (voucher_code, session['user_id']))
+        deposit = cursor.fetchone()
+        
+        if not deposit:
+            return redirect(url_for('index', error="Voucher not found"))
+    
+    return render_template_string(deposit_voucher_html, deposit=deposit)
+
+@app.route("/admin/process_deposit", methods=["POST"])
+#@login_required(role='admin')
+@limiter.limit("50 per hour")
+def process_deposit():
+    if not session.get("is_admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+    
+    deposit_id = request.form.get("deposit_id")
+    action = request.form.get("action")
+    admin_notes = request.form.get("admin_notes", "")
+    
+    if not deposit_id or not action:
+        return jsonify({"error": "Missing parameters"}), 400
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT user_id, amount, status 
+                FROM deposit_requests 
+                WHERE id = %s
+            """, (deposit_id,))
+            deposit = cursor.fetchone()
+            
+            if not deposit:
+                return jsonify({"error": "Deposit not found"}), 404
+            
+            user_id, amount, current_status = deposit
+            
+            if current_status != 'pending':
+                return jsonify({"error": "Deposit already processed"}), 400
+            
+            admin_id = session.get("admin_id")
+            processed_time = datetime.now()
+            
+            if action == 'approve':
+                # Add funds to user wallet
+                cursor.execute("""
+                    UPDATE users 
+                    SET wallet = wallet + %s 
+                    WHERE id = %s
+                """, (amount, user_id))
+                
+                # Record transaction
+                cursor.execute("""
+                    INSERT INTO transactions (user_id, type, amount, timestamp)
+                    VALUES (%s, 'deposit', %s, %s)
+                """, (user_id, amount, processed_time))
+                
+                # Update deposit request
+                cursor.execute("""
+                    UPDATE deposit_requests 
+                    SET status = 'completed', processed_time = %s, 
+                        processed_by = %s, admin_notes = %s
+                    WHERE id = %s
+                """, (processed_time, admin_id, admin_notes, deposit_id))
+                
+            elif action == 'reject':
+                cursor.execute("""
+                    UPDATE deposit_requests 
+                    SET status = 'rejected', processed_time = %s, 
+                        processed_by = %s, admin_notes = %s
+                    WHERE id = %s
+                """, (processed_time, admin_id, admin_notes, deposit_id))
+            
+            conn.commit()
+            return jsonify({"success": True, "message": f"Deposit {action}ed"})
+            
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Process deposit error: {e}")
+        return jsonify({"error": "System error"}), 500
+        
+            
+@app.route('/api/game/status')
+def game_status():
+    # Replace this with your actual game logic
+    game_just_won = False  
+
+    return jsonify({'status': 'success' if game_just_won else 'pending'})            
+                  
+        
+#NON MONETARY ADMIN FUNCTIONS
+###################
+
+admin_withdrawals_html = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pay with M-Pesa</title>
-    
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.1.3/css/bootstrap.min.css">
+    <title>Withdrawal Management - HARAMBEE CASH!</title>
     <style>
         body {
-            background-color: #f4f7fa;
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(to right, #43cea2, #185a9d);
+            color: white;
         }
         .container {
-            max-width: 600px;
+            max-width: 1200px;
             margin: 0 auto;
-            padding-top: 50px;
-        }
-        .card {
-            border: none;
-            border-radius: 10px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            background: rgba(0, 0, 0, 0.8);
             padding: 20px;
-            background-color: #ffffff;
+            border-radius: 15px;
         }
-        h2 {
-            color: #007bff;
-            font-weight: bold;
+        h1 {
+            color: #ffcc00;
             text-align: center;
-            margin-bottom: 30px;
         }
-        label {
-            font-weight: bold;
-            color: #343a40;
+        .pending-badge {
+            background: #ff5722;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            margin-left: 10px;
         }
-        .form-control {
-            border-radius: 10px;
-            font-size: 1.25rem;
+        .withdrawal-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            background: rgba(255,255,255,0.1);
+        }
+        .withdrawal-table th, .withdrawal-table td {
             padding: 12px;
+            border: 1px solid #444;
+            text-align: left;
+        }
+        .withdrawal-table th {
+            background: rgba(76, 175, 80, 0.3);
+            color: #ffcc00;
+        }
+        .status-pending { color: #ff9800; font-weight: bold; }
+        .status-completed { color: #4CAF50; font-weight: bold; }
+        .status-rejected { color: #f44336; font-weight: bold; }
+        .action-buttons {
+            display: flex;
+            gap: 5px;
         }
         .btn {
-            background-color: #28a745;
-            color: #fff;
-            border-radius: 25px;
-            font-size: 18px;
-            padding: 10px;
-            width: 100%;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
         }
-        .btn:hover {
-            background-color: #218838;
+        .btn-approve { background: #4CAF50; color: white; }
+        .btn-reject { background: #f44336; color: white; }
+        .btn:disabled {
+            background: #666;
+            cursor: not-allowed;
         }
-        /* Style for outstanding error messages */
-        .alert-danger {
-            background-color: #f8d7da; /* Bright background */
-            color: #dc3545; /* Red text */
-            font-size: 1.25rem;
-            font-weight: bold;
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 20px;
+        .back-link {
             text-align: center;
+            margin-top: 20px;
         }
-        .alert-info {
-            background-color: #d1ecf1;
-            color: #0c5460;
-            border-color: #bee5eb;
-            border-radius: 10px;
-        }
-        .note-box {
-            background-color: #ffefba;
-            border: 2px solid #f8c146;
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 20px;
-            font-size: 1.1rem;
-            text-align: center;
+        .back-link a {
+            color: #ffcc00;
+            text-decoration: none;
             font-weight: bold;
-            color: #333;
-        }
-        .note-box h3 {
-            color: #e67e22;
-        }
-        .mpesa-details {
-            font-size: 1.2rem;
-            color: #c0392b;
-        }
-        /* Adding space between buttons */
-        .mb-5 {
-            margin-bottom: 50px; /* Larger gap for the last button */
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="card">
-            <h2>Pay with M-Pesa</h2>           
-
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    <div class="alert alert-info">
-                        {% for category, message in messages %}
-                            <div class="alert alert-{{ category }}">{{ message }}</div>
-                        {% endfor %}
-                    </div>
-                {% endif %}
-            {% endwith %}
-            
-            <form method="POST" action="/pay">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">            
-                <div class="mb-4">
-                    <label for="phone_number" class="form-label">Phone Number</label>
-                    <input type="tel" class="form-control" id="phone_number" name="phone_number" placeholder="e.g., 2547XXXXXXXX" required>
-                </div>
-                
-                <!-- Sandwiched Buttons -->
-                <div class="mb-4">
-                    <button type="submit" class="btn btn-success">Pay KES 2</button>
-                </div>
-
-                <div class="note-box">
-                    <h3>IMPORTANT NOTE</h3>
-                    <p>IF THE ABOVE MPESA PAYMENT FOR TOKEN PURCHASE FAILS: Please pay directly to M-Pesa Buy Goods TILL NO: <span class="mpesa-details">4487938</span></p>
-                    <p><strong>JAMES BOYID OCHUNA</strong></p>
-                    <p>and wait for your token to be sent to your telephone number shortly.</p>
-                </div>
-
-                <!-- Home Button -->
-                <div class="mb-5">
-                    <a href="/" class="btn btn-info">Home</a>
-                </div>
-            </form>
+        <h1>Withdrawal Management <span class="pending-badge">{{ pending_count }} Pending</span></h1>
+        
+        <table class="withdrawal-table">
+            <thead>
+                <tr>
+                    <th>Receipt Code</th>
+                    <th>User</th>
+                    <th>Requested</th>
+                    <th>Fee</th>
+                    <th>Net Amount</th>
+                    <th>Status</th>
+                    <th>Request Time</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for w in withdrawals %}
+                <tr>
+                    <td><strong>{{ w[11] }}</strong></td>
+                    <td>{{ w[2] }}<br><small>{{ w[12] }}</small></td>
+                    <td>KES {{ "%.2f"|format(w[3]) }}</td>
+                    <td>KES {{ "%.2f"|format(w[4]) }}</td>
+                    <td><strong>KES {{ "%.2f"|format(w[5]) }}</strong></td>
+                    <td class="status-{{ w[6] }}">{{ w[6]|upper }}</td>
+                    <td>{{ w[7].strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td class="action-buttons">
+                        {% if w[6] == 'pending' %}
+                        <button class="btn btn-approve" onclick="processWithdrawal({{ w[0] }}, 'approve')">Approve</button>
+                        <button class="btn btn-reject" onclick="processWithdrawal({{ w[0] }}, 'reject')">Reject</button>
+                        {% else %}
+                        <button class="btn" disabled>Processed</button>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        
+        <div class="back-link">
+            <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
         </div>
     </div>
+
+    <script>
+    function processWithdrawal(withdrawalId, action) {
+        const adminNotes = prompt('Enter admin notes:') || '';
+        
+        fetch('/admin/process_withdrawal', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `withdrawal_id=${withdrawalId}&action=${action}&admin_notes=${encodeURIComponent(adminNotes)}`
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('Withdrawal ' + action + 'ed successfully');
+                location.reload();
+            } else {
+                alert('Error: ' + data.error);
+            }
+        })
+        .catch(error => {
+            alert('System error: ' + error);
+        });
+    }
+    </script>
+</body>
+</html>
+"""             
+       
+withdraw_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Withdraw Earnings - HARAMBEE CASH!</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: rgba(0, 0, 0, 0.9);
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.3);
+            max-width: 500px;
+            width: 90%;
+        }
+        h1 {
+            color: #ffcc00;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .balance-display {
+            background: linear-gradient(135deg, #4CAF50, #45a049);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .balance-amount {
+            font-size: 2rem;
+            font-weight: bold;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #ffcc00;
+            font-weight: bold;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #333;
+            border-radius: 8px;
+            background: rgba(255,255,255,0.1);
+            color: white;
+            font-size: 1rem;
+            box-sizing: border-box;
+        }
+        input:focus {
+            border-color: #ffcc00;
+            outline: none;
+        }
+        button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #ffcc00, #ff9900);
+            color: #333;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(255, 204, 0, 0.4);
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        .error {
+            background: #d32f2f;
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .fee-info {
+            background: rgba(255, 204, 0, 0.1);
+            border: 1px solid #ffcc00;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .rules {
+            margin-top: 25px;
+            padding: 15px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+        }
+        .rules h3 {
+            color: #ffcc00;
+            margin-bottom: 10px;
+        }
+        .rules ul {
+            padding-left: 20px;
+        }
+        .rules li {
+            margin-bottom: 8px;
+            color: #ccc;
+        }
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .back-link a {
+            color: #ffcc00;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ðŸ’° Withdraw Earnings</h1>
+        
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        
+        <div class="balance-display">
+            <div>Available Win Earnings</div>
+            <div class="balance-amount">KES {{ "%.2f"|format(available_balance|default(0)) }}</div>
+        </div>
+        
+        {% if can_withdraw %}
+        <div class="fee-info">
+            <strong>ðŸ’° Withdrawal Fees:</strong><br>
+            â€¢ KES 100-1,000: KES 10 fee<br>
+            â€¢ KES 1,001-5,000: KES 25 fee<br>
+            â€¢ KES 5,001-20,000: KES 50 fee<br>
+            â€¢ KES 20,001-50,000: KES 100 fee
+        </div>
+        
+        <form method="POST" action="/withdraw">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            
+            <div class="form-group">
+                <label for="amount">Withdrawal Amount (KES)</label>
+                <input type="number" id="amount" name="amount" 
+                       min="100" max="50000" step="0.01" 
+                       placeholder="Enter amount (min: KES 100)" required>
+            </div>
+            
+            <button type="submit" {% if available_balance|default(0) < 100 %}disabled{% endif %}>
+                {% if available_balance|default(0) < 100 %}
+                    Minimum KES 100 Required
+                {% else %}
+                    Submit Withdrawal Request
+                {% endif %}
+            </button>
+        </form>
+        {% else %}
+        <div class="fee-info">
+            <strong>Withdrawal Limit Reached</strong>
+            <p>You can only make one withdrawal every 24 hours.</p>
+            {% if last_withdrawal %}
+            <p>Last withdrawal: {{ last_withdrawal.strftime('%Y-%m-%d %H:%M') }}</p>
+            {% endif %}
+        </div>
+        {% endif %}
+        
+        <div class="rules">
+            <h3>ðŸ“‹ Withdrawal Rules</h3>
+            <ul>
+                <li>âœ… Minimum withdrawal: KES 100</li>
+                <li>âœ… Funds must be from game winnings only</li>
+                <li>âœ… One withdrawal every 24 hours</li>
+                <li>âœ… Withdrawal fees apply as shown above</li>
+                <li>âŒ Excessive attempts = 6 hour suspension</li>
+                <li>âœ… Processed within 24 hours by admin</li>
+            </ul>
+        </div>
+        
+        <div class="back-link">
+            <a href="/">â† Back to Home</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+###############
+
+admin_deposit_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deposit Management - HARAMBEE CASH!</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 15px;
+            background: linear-gradient(to right, #43cea2, #185a9d);
+            color: white;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 10px;
+        }
+        h1 {
+            color: #ffcc00;
+            text-align: center;
+            font-size: 1.5rem;
+        }
+        .pending-badge {
+            background: #ff5722;
+            color: white;
+            padding: 3px 8px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            margin-left: 8px;
+        }
+        .deposit-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+            background: rgba(255,255,255,0.1);
+            font-size: 0.8rem;
+        }
+        .deposit-table th, .deposit-table td {
+            padding: 8px;
+            border: 1px solid #444;
+            text-align: left;
+        }
+        .deposit-table th {
+            background: rgba(76, 175, 80, 0.3);
+            color: #ffcc00;
+        }
+        .status-pending { color: #ff9800; font-weight: bold; }
+        .status-completed { color: #4CAF50; font-weight: bold; }
+        .status-rejected { color: #f44336; font-weight: bold; }
+        .action-buttons {
+            display: flex;
+            gap: 3px;
+        }
+        .btn {
+            padding: 4px 8px;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.7rem;
+        }
+        .btn-approve { background: #4CAF50; color: white; }
+        .btn-reject { background: #f44336; color: white; }
+        .btn:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        .back-link {
+            text-align: center;
+            margin-top: 15px;
+        }
+        .back-link a {
+            color: #ffcc00;
+            text-decoration: none;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Deposit Management <span class="pending-badge">{{ pending_count }} Pending</span></h1>
+        
+        <table class="deposit-table">
+            <thead>
+                <tr>
+                    <th>Voucher Code</th>
+                    <th>User</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                    <th>Request Time</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for d in deposits %}
+                <tr>
+                    <td><strong>{{ d[4] }}</strong></td>
+                    <td>{{ d[2] }}<br><small>{{ d[8] }}</small></td>
+                    <td>KES {{ "%.2f"|format(d[3]) }}</td>
+                    <td class="status-{{ d[5] }}">{{ d[5].upper() }}</td>
+                    <td>{{ d[6].strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td class="action-buttons">
+                        {% if d[5] == 'pending' %}
+                        <button class="btn btn-approve" onclick="processDeposit({{ d[0] }}, 'approve')">Approve</button>
+                        <button class="btn btn-reject" onclick="processDeposit({{ d[0] }}, 'reject')">Reject</button>
+                        {% else %}
+                        <button class="btn" disabled>Processed</button>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        
+        <div class="back-link">
+            <a href="/admin/dashboard">← Back to Admin Dashboard</a>
+        </div>
+    </div>
+
+    <script>
+    function processDeposit(depositId, action) {
+        const adminNotes = prompt('Enter admin notes:') || '';
+        
+        fetch('/admin/process_deposit', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `deposit_id=${depositId}&action=${action}&admin_notes=${encodeURIComponent(adminNotes)}`
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('Deposit ' + action + 'd successfully');
+                location.reload();
+            } else {
+                alert('Error: ' + data.error);
+            }
+        })
+        .catch(error => {
+            alert('System error: ' + error);
+        });
+    }
+    </script>
+</body>
+</html>
+"""
+
+withdrawal_receipt_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Withdrawal Receipt - HARAMBEE CASH!</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 10px;
+            padding: 0;
+            background: white;
+            color: black;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .receipt-container {
+            background: white;
+            border: 2px solid #333;
+            padding: 15px;
+            border-radius: 8px;
+            max-width: 300px;
+            width: 100%;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .receipt-header {
+            text-align: center;
+            border-bottom: 2px dashed #333;
+            padding-bottom: 10px;
+            margin-bottom: 12px;
+        }
+        .receipt-header h1 {
+            color: #ff6B35;
+            margin: 0;
+            font-size: 1.2rem;
+        }
+        .receipt-code {
+            background: #333;
+            color: #ffcc00;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+        .receipt-details {
+            margin-bottom: 15px;
+        }
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+            padding: 4px 0;
+            border-bottom: 1px solid #eee;
+            font-size: 0.8rem;
+        }
+        .detail-label {
+            font-weight: bold;
+            color: #666;
+        }
+        .detail-value {
+            font-weight: bold;
+        }
+        .amount-highlight {
+            background: #4CAF50;
+            color: white;
+            padding: 8px;
+            border-radius: 5px;
+            text-align: center;
+            margin: 10px 0;
+        }
+        .fee-deduction {
+            color: #f44336;
+            font-weight: bold;
+        }
+        .instructions {
+            background: #fff3cd;
+            color: #856404;
+            padding: 10px;
+            border-radius: 5px;
+            border-left: 3px solid #ffc107;
+            margin: 12px 0;
+            font-size: 0.75rem;
+        }
+        .action-buttons {
+            text-align: center;
+            margin-top: 15px;
+        }
+        .btn {
+            padding: 8px 15px;
+            margin: 0 3px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 0.8rem;
+        }
+        .btn-print {
+            background: #2196F3;
+            color: white;
+        }
+        .btn-home {
+            background: #4CAF50;
+            color: white;
+        }
+        @media print {
+            body {
+                padding: 0;
+                margin: 0;
+            }
+            .receipt-container {
+                box-shadow: none;
+                border: 1px solid #333;
+                max-width: 100%;
+            }
+            .action-buttons {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="receipt-container">
+        <div class="receipt-header">
+            <h1>HARAMBEE CASH</h1>
+            <p style="margin: 5px 0; font-size: 0.9rem;">Withdrawal Receipt</p>
+            <div class="receipt-code">{{ withdrawal[11] }}</div>
+        </div>
+        
+        <div class="receipt-details">
+            <div class="detail-row">
+                <span class="detail-label">Username:</span>
+                <span class="detail-value">{{ withdrawal[2] }}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Email:</span>
+                <span class="detail-value" style="font-size: 0.7rem;">{{ withdrawal[12] }}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Date:</span>
+                <span class="detail-value">{{ withdrawal[7].strftime('%Y-%m-%d') }}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Time:</span>
+                <span class="detail-value">{{ withdrawal[7].strftime('%H:%M') }}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Status:</span>
+                <span class="detail-value" style="color: #ff9800;">{{ withdrawal[6].upper() }}</span>
+            </div>
+        </div>
+        
+        <div class="amount-highlight">
+            <div style="font-size: 0.8rem; opacity: 0.9;">Requested Amount</div>
+            <div style="font-size: 1.3rem; font-weight: bold;">KES {{ "%.2f"|format(withdrawal[3]) }}</div>
+        </div>
+        
+        <div class="receipt-details">
+            <div class="detail-row">
+                <span class="detail-label">Withdrawal Fee:</span>
+                <span class="detail-value fee-deduction">- KES {{ "%.2f"|format(withdrawal[4]) }}</span>
+            </div>
+            <div class="detail-row" style="border-bottom: 2px solid #333; font-size: 0.9rem;">
+                <span class="detail-label">Net Amount:</span>
+                <span class="detail-value" style="color: #4CAF50;">KES {{ "%.2f"|format(withdrawal[5]) }}</span>
+            </div>
+        </div>
+        
+        <div class="instructions">
+            <strong>📋 FOR ADMIN PROCESSING:</strong><br>
+            "Kindly send KES {{ "%.2f"|format(withdrawal[5]) }} to the user via platform M-Pesa number as per system approval."
+            <br><br>
+            <strong>ℹ️ VERIFICATION:</strong> Use independent M-Pesa records for transaction confirmation.
+        </div>
+        
+        <div class="action-buttons">
+            <button class="btn btn-print" onclick="window.print()">🖨️ Print</button>
+            <a href="/" class="btn btn-home">🏠 Home</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+deposit_voucher_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deposit Voucher - HARAMBEE CASH!</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 10px;
+            padding: 0;
+            background: white;
+            color: black;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .voucher-container {
+            background: white;
+            border: 2px solid #333;
+            padding: 15px;
+            border-radius: 8px;
+            max-width: 300px;
+            width: 100%;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .voucher-header {
+            text-align: center;
+            border-bottom: 2px dashed #333;
+            padding-bottom: 10px;
+            margin-bottom: 12px;
+        }
+        .voucher-header h1 {
+            color: #ff6B35;
+            margin: 0;
+            font-size: 1.2rem;
+        }
+        .voucher-code {
+            background: #333;
+            color: #ffcc00;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+        .voucher-details {
+            margin-bottom: 15px;
+        }
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+            padding: 4px 0;
+            border-bottom: 1px solid #eee;
+            font-size: 0.8rem;
+        }
+        .detail-label {
+            font-weight: bold;
+            color: #666;
+        }
+        .detail-value {
+            font-weight: bold;
+        }
+        .amount-section {
+            background: #4CAF50;
+            color: white;
+            padding: 8px;
+            border-radius: 5px;
+            text-align: center;
+            margin: 10px 0;
+        }
+        .instructions {
+            background: #fff3cd;
+            color: #856404;
+            padding: 10px;
+            border-radius: 5px;
+            border-left: 3px solid #ffc107;
+            margin: 12px 0;
+            font-size: 0.75rem;
+        }
+        .action-buttons {
+            text-align: center;
+            margin-top: 15px;
+        }
+        .btn {
+            padding: 8px 15px;
+            margin: 0 3px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 0.8rem;
+        }
+        .btn-print {
+            background: #2196F3;
+            color: white;
+        }
+        .btn-home {
+            background: #4CAF50;
+            color: white;
+        }
+        @media print {
+            body {
+                padding: 0;
+                margin: 0;
+            }
+            .voucher-container {
+                box-shadow: none;
+                border: 1px solid #333;
+                max-width: 100%;
+            }
+            .action-buttons {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="voucher-container">
+        <div class="voucher-header">
+            <h1>HARAMBEE CASH</h1>
+            <p style="margin: 5px 0; font-size: 0.9rem;">Deposit Voucher</p>
+            <div class="voucher-code">{{ deposit[4] }}</div>
+        </div>
+        
+        <div class="voucher-details">
+            <div class="detail-row">
+                <span class="detail-label">Username:</span>
+                <span class="detail-value">{{ deposit[2] }}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Date:</span>
+                <span class="detail-value">{{ deposit[6].strftime('%Y-%m-%d') }}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Time:</span>
+                <span class="detail-value">{{ deposit[6].strftime('%H:%M') }}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Status:</span>
+                <span class="detail-value" style="color: #ff9800;">{{ deposit[5].upper() }}</span>
+            </div>
+        </div>
+        
+        <div class="amount-section">
+            <div style="font-size: 0.8rem; opacity: 0.9;">Deposit Amount</div>
+            <div style="font-size: 1.3rem; font-weight: bold;">KES {{ "%.2f"|format(deposit[3]) }}</div>
+        </div>
+        
+        <div class="instructions">
+            <strong>📋 PRESENT TO ADMIN:</strong><br>
+            "Kindly update my platform wallet account with the M-Pesa amount sent to your platform recently!"
+            <br><br>
+            <strong>ℹ️ NOTE:</strong> No M-Pesa confirmation message needed. Platform has official M-Pesa number for verification.
+        </div>
+        
+        <div class="action-buttons">
+            <button class="btn btn-print" onclick="window.print()">🖨️ Print</button>
+            <a href="/" class="btn btn-home">🏠 Home</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+deposit_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deposit Funds - HARAMBEE CASH!</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: rgba(0, 0, 0, 0.9);
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+            max-width: 450px;
+            width: 95%;
+        }
+        h1 {
+            color: #ffcc00;
+            text-align: center;
+            margin-bottom: 15px;
+            font-size: 1.4rem;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 6px;
+            color: #ffcc00;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+        input {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #333;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.1);
+            color: white;
+            font-size: 0.9rem;
+            box-sizing: border-box;
+        }
+        input:focus {
+            border-color: #ffcc00;
+            outline: none;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #4CAF50, #45a049);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: bold;
+            cursor: pointer;
+            margin: 10px 0;
+        }
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 3px 10px rgba(76, 175, 80, 0.4);
+        }
+        .error {
+            background: #d32f2f;
+            color: white;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            text-align: center;
+            font-size: 0.9rem;
+        }
+        .info-box {
+            background: rgba(255, 204, 0, 0.1);
+            border: 1px solid #ffcc00;
+            padding: 12px;
+            border-radius: 6px;
+            margin: 15px 0;
+            font-size: 0.85rem;
+        }
+        .rules {
+            margin-top: 20px;
+            padding: 12px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 6px;
+            font-size: 0.8rem;
+        }
+        .rules h3 {
+            color: #ffcc00;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+        }
+        .rules ul {
+            padding-left: 15px;
+            margin: 0;
+        }
+        .rules li {
+            margin-bottom: 5px;
+        }
+        .back-link {
+            text-align: center;
+            margin-top: 15px;
+        }
+        .back-link a {
+            color: #ffcc00;
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>💰 Deposit Funds</h1>
+        
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        
+        <div class="info-box">
+            <strong>📱 Payment Instructions:</strong><br>
+            1. Send money via M-Pesa to our official number<br>
+            2. Generate deposit voucher below<br>
+            3. Present voucher to admin for verification<br>
+            4. Funds added to wallet after confirmation
+        </div>
+        
+        {% if can_deposit %}
+        <form method="POST" action="/deposit">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            
+            <div class="form-group">
+                <label for="amount">Deposit Amount (KES)</label>
+                <input type="number" id="amount" name="amount" 
+                       min="50" max="50000" step="0.01" 
+                       placeholder="Enter amount (min: KES 50)" required>
+            </div>
+            
+            <button type="submit">
+                Generate Deposit Voucher
+            </button>
+        </form>
+        {% endif %}
+        
+        <div class="rules">
+            <h3>📋 Deposit Rules</h3>
+            <ul>
+                <li>✅ Minimum deposit: KES 50</li>
+                <li>✅ Maximum deposit: KES 50,000</li>
+                <li>✅ Use official M-Pesa number only</li>
+                <li>✅ Keep transaction details safe</li>
+                <li>✅ Processing time: Within 2 hours</li>
+                <li>❌ No fake deposits tolerated</li>
+            </ul>
+        </div>
+        
+        <div class="back-link">
+            <a href="/">← Back to Home</a>
+        </div>
+    </div>
+</body>
+</html>
+"""                              
+
+
+cashbook_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Financial Cashbook - HARAMBEE CASH!</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(to right, #43cea2, #185a9d);
+            color: white;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .cashbook-windows {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .cashbook-window {
+            background: rgba(0, 0, 0, 0.8);
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        }
+        .cashbook-window h3 {
+            color: #ffcc00;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+        .financial-item {
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+            padding: 8px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 5px;
+        }
+        .financial-value {
+            font-weight: bold;
+            color: #4CAF50;
+        }
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .back-link a {
+            color: #ffcc00;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        .back-link a:hover {
+            text-decoration: underline;
+        }
+        .transaction-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        .transaction-table th, .transaction-table td {
+            padding: 8px;
+            text-align: center;
+            border: 1px solid #444;
+        }
+        .transaction-table th {
+            background: rgba(76, 175, 80, 0.3);
+        }
+        .profit-badge {
+            background: #4CAF50;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.8rem;
+        }
+        .last-updated {
+            text-align: center;
+            color: #ccc;
+            font-size: 0.9rem;
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Financial Cashbook</h1>
+        <div class="last-updated">
+            Last updated: <span id="currentTime"></span>
+        </div>
+        
+        <div class="cashbook-windows">
+            <div class="cashbook-window">
+                <h3>ðŸ’° GROSS PLATFORM PROFIT</h3>
+                <div class="financial-item">
+                    <span>Total Profit:</span>
+                    <span class="financial-value">Ksh. {{ "%.2f"|format(data.total_gross_profit) }}</span>
+                </div>
+                <div class="financial-item">
+                    <span>Profitable Games:</span>
+                    <span class="financial-value">{{ data.total_profitable_games }}</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="cashbook-window">
+            <h3>ðŸ“ RECENT PROFIT TRANSACTIONS</h3>
+            {% if data.recent_profits %}
+            <table class="transaction-table">
+                <thead>
+                    <tr>
+                        <th>Game Code</th>
+                        <th>Time</th>
+                        <th>Players</th>
+                        <th>Total Pool</th>
+                        <th>Platform Profit</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for profit in data.recent_profits %}
+                    <tr>
+                        <td>{{ profit[0] }}</td>
+                        <td>
+                            {% if profit[1] != 'N/A' %}
+                                {{ profit[1].strftime('%H:%M') }}
+                            {% else %}
+                                N/A
+                            {% endif %}
+                        </td>
+                        <td>{{ profit[2] }}</td>
+                        <td>Ksh. {{ "%.2f"|format(profit[3]) }}</td>
+                        <td><span class="profit-badge">Ksh. {{ "%.2f"|format(profit[4]) }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div style="text-align: center; color: #ccc; padding: 20px;">
+                No profitable games recorded yet.
+            </div>
+            {% endif %}
+        </div>
+        
+        <div class="back-link">
+            <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
+        </div>
+    </div>
+
+    <script>
+        // Simple time display - no auto refresh
+        document.getElementById('currentTime').textContent = new Date().toLocaleString();
+    </script>
+</body>
+</html>
+"""
+
+base_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HARAMBEE CASH - Play & Win Big!</title>
+
+    <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}" />
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.ico') }}" />
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='apple-touch-icon.png') }}" />
+    <meta name="description" content="Harambee Cash - Play exciting games and win big prizes. Join our community gaming platform today!" />
+    <meta name="keywords" content="gaming, cash prizes, harambee, win money, online games" />
+
+    <!-- Core Styles (kept compact and self-contained) -->
+    <style>
+        :root {
+            --gold-primary: #D4AF37;
+            --gold-secondary: #FFD700;
+            --gold-light: #F7EF8A;
+            --gold-dark: #B8860B;
+            --gold-accent: #FFC125;
+            --gold-gradient: linear-gradient(135deg, #D4AF37 0%, #FFD700 50%, #F7EF8A 100%);
+            --gold-gradient-reverse: linear-gradient(135deg, #F7EF8A 0%, #FFD700 50%, #D4AF37 100%);
+            --gold-gradient-subtle: linear-gradient(135deg, rgba(212,175,55,0.08) 0%, rgba(255,215,0,0.06) 100%);
+            --dark-bg: #1A1A1A;
+            --dark-card: #2D2D2D;
+            --text-light: #FFFFFF;
+            --text-gold: #FFD700;
+            --text-muted: #CCCCCC;
+            --shadow: 0 8px 30px rgba(212, 175, 55, 0.15);
+            --shadow-hover: 0 15px 40px rgba(212, 175, 55, 0.25);
+            --radius: 20px;
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            --success: #00C9B1;
+            --error: #FF6B35;
+            --warning: #FFD166;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html, body {
+            height: 100%;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--dark-bg);
+            color: var(--text-light);
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 18px;
+            background: rgba(0,0,0,0.25);
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            position: sticky;
+            top: 0;
+            z-index: 50;
+        }
+
+        .site-logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        /* Ensure the logo image keeps original colors and is not affected by global theme */
+        .site-logo img {
+            height: 48px;
+            width: auto;
+            filter: none !important;
+            mix-blend-mode: normal !important;
+            image-rendering: auto;
+            border-radius: 6px;
+            background: transparent;
+        }
+
+        .site-title {
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: var(--text-light);
+            letter-spacing: 0.6px;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .wallet-badge {
+            background: rgba(255,215,0,0.06);
+            border: 1px solid rgba(212,175,55,0.12);
+            padding: 8px 12px;
+            border-radius: 999px;
+            color: var(--text-gold);
+            font-weight: 700;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.95rem;
+        }
+
+        nav {
+            display: flex;
+            justify-content: center;
+            gap: 14px;
+            padding: 10px 8px;
+            background: linear-gradient(180deg, rgba(0,0,0,0.06), transparent);
+        }
+
+        nav a {
+            color: var(--text-muted);
+            text-decoration: none;
+            padding: 8px 10px;
+            border-radius: 8px;
+            transition: var(--transition);
+            font-weight: 600;
+        }
+
+        nav a:hover {
+            color: var(--text-light);
+            background: rgba(255,255,255,0.03);
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 20px auto;
+            padding: 20px;
+        }
+
+        .card {
+            background: var(--dark-card);
+            border-radius: var(--radius);
+            padding: 20px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(212, 175, 55, 0.06);
+            margin-bottom: 20px;
+        }
+
+        .logo-container { text-align: center; margin-bottom: 10px; }
+        .logo-text { color: var(--text-light); font-weight: 800; font-size: 1.6rem; }
+
+        .tagline { color: var(--text-gold); margin-top: 8px; font-weight: 600; }
+
+        .balance-display {
+            background: linear-gradient(180deg, rgba(255,215,0,0.04), rgba(255,215,0,0.02));
+            border-radius: 14px;
+            padding: 16px;
+            text-align: center;
+            display: inline-block;
+        }
+
+        .balance-label { color: var(--text-muted); font-size: 0.95rem; }
+        .balance-amount { color: var(--gold-secondary); font-weight: 800; font-size: 1.6rem; }
+
+        .cta-button {
+            background: var(--gold-gradient);
+            color: var(--dark-bg);
+            border: none;
+            padding: 8px 40px;
+            font-size: 1rem;
+            font-weight: 700;
+            border-radius: 999px;
+            cursor: pointer;
+            transition: var(--transition);
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .cta-button:hover { transform: translateY(-3px); background: var(--gold-gradient-reverse); }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-top: 18px;
+        }
+
+        .feature-card {
+            background: rgba(255,255,255,0.02);
+            padding: 14px;
+            border-radius: 12px;
+            border: 1px solid rgba(212,175,55,0.04);
+        }
+
+        .game-window {
+            margin: 20px 0;
+            padding: 18px;
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(212,175,55,0.03), rgba(255,215,0,0.02));
+            border: 1px solid rgba(212,175,55,0.06);
+        }
+
+        .game-result { background: rgba(0,0,0,0.25); padding: 12px; border-radius: 12px; margin-bottom: 12px; }
+
+        .offline-banner {
+            background: rgba(255,107,53,0.08);
+            border: 1px solid rgba(255,107,53,0.12);
+            color: var(--error);
+            padding: 14px;
+            border-radius: 12px;
+            margin: 12px 0;
+        }
+
+        .offline-btn {
+            background: rgba(255,215,0,0.06);
+            border: 1px solid rgba(212,175,55,0.12);
+            color: var(--text-gold);
+            padding: 10px 14px;
+            border-radius: 12px;
+            cursor: pointer;
+        }
+
+        .trivia-option {
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(212,175,55,0.06);
+            padding: 12px;
+            border-radius: 12px;
+            cursor: pointer;
+            margin-bottom: 8px;
+        }
+
+        .trivia-correct { background: rgba(0,201,177,0.12); border-color: var(--success); }
+        .trivia-wrong { background: rgba(255,107,53,0.12); border-color: var(--error); }
+
+        .achievement-notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: var(--gold-gradient);
+            color: var(--dark-bg);
+            padding: 16px;
+            border-radius: 16px;
+            box-shadow: var(--shadow-hover);
+            z-index: 10000;
+        }
+
+        /* Game animation overlay */
+        .game-animation {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+            flex-direction: column;
+        }
+
+        .animation-content { text-align: center; color: white; }
+        .animated-image { font-size: 6rem; margin-bottom: 16px; animation: bounce 1s infinite; }
+        .animation-text { font-size: 1.6rem; font-weight: 700; text-shadow: 0 0 10px rgba(255,215,0,0.8); }
+
+        .rocket, .confetti { position: absolute; font-size: 1.6rem; animation: floatUp 2s ease-out forwards; }
+        .confetti { width: 10px; height: 10px; border-radius: 2px; }
+
+        @keyframes floatUp {
+            to { transform: translateY(-100vh) rotate(360deg); opacity: 0; }
+        }
+        @keyframes bounce {
+            0%,100% { transform: translateY(0); } 50% { transform: translateY(-20px); }
+        }
+
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        /* Responsive tweaks */
+        @media (max-width: 600px) {
+            .site-title { font-size: 1rem; }
+            .site-logo img { height: 40px; }
+            .container { padding: 12px; margin: 12px; }
+        }
+        .game-result {
+            background: rgba(255,255,255,0.05);
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            border-left: 3px solid var(--gold-primary);
+        }
+
+        .game-result p {
+            margin: 5px 0;
+            font-size: 0.9rem;
+        }        
+    </style>    
+
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+    <meta name="theme-color" content="#your-theme-color">
+    
+    <!-- iOS Safari PWA support -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Harambee Cash">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192x192.png') }}">
+    
+    <!-- PWA meta tags -->
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Play & Win Big with Golden Opportunities!">    
+</head>
+<body>
+    <audio id="gameEndSound" preload="auto" style="display: none;">
+    <source src="{{ url_for('static', filename='sounds/game-end.mp3') }}" type="audio/mpeg">
+    </audio>
+    <!-- Header (logo kept in true color) -->
+    <header>
+        <div class="site-logo" style="align-items:center;">
+            <img src="{{ url_for('static', filename='piclog.png') }}" alt="Harambee Cash Logo" />
+            <div>
+                <div class="site-title">HARAMBEE CASH</div>
+                <div class="tagline" style="font-size:0.85rem; margin-top:4px;">Play & Win Big with Golden Opportunities!</div>
+            </div>                          
+            <div class="header-actions">
+                {% if session.get('user_id') %}
+                    <div class="wallet-badge">Ksh. {{ wallet_balance | default(0.0) | float | round(2) }}</div>
+                    <!-- PWA Install Button -->
+                    <button id="install-btn" class="cta-button" style="display:none;">📱 Install App</button>
+                    <!-- Play form -->                    
+                    <form method="POST" action="{{ url_for('play') }}" id="playForm" style="text-align:center; margin-bottom:16px;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                        <button type="submit" id="playButton" class="cta-button">🎮 PLAY NOW & WIN BIG!</button>
+                    </form>                                         
+                {% endif %}
+            </div>
+        </div>                      
+    </header>                   
+
+    <!-- Navigation -->
+    <nav>
+        {% if not session.get('user_id') %}
+            <a href="{{ url_for('register') }}">📝 Register</a>
+            <a href="{{ url_for('login') }}">🔑 Login</a>
+        {% else %}
+            <a href="{{ url_for('deposit') }}">💳 Deposit</a>
+            <a href="{{ url_for('withdraw') }}">📤 Withdraw</a>
+            <a href="{{ url_for('logout') }}">🚪 Logout</a>
+            {% if session.get('is_admin') %}
+                <a href="{{ url_for('admin_dashboard') }}">🛠 Admin</a>
+            {% endif %}
+        {% endif %}
+    </nav>
+
+    <div class="container">
+        <!-- Flash messages (kept to work with Flask's flash) -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="card" style="border-left:4px solid rgba(255,255,255,0.04); margin-bottom:12px;">
+                        <div style="color: var(--text-muted);">{{ message }}</div>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% if error %}<div class="card" style="border-left:4px solid var(--error); color:var(--error);">{{ error }}</div>{% endif %}
+        {% if message %}<div class="card" style="border-left:4px solid var(--success); color:var(--success);">{{ message }}</div>{% endif %}
+        {% if warning %}<div class="card" style="border-left:4px solid var(--warning); color:var(--warning);">{{ warning }}</div>{% endif %}
+
+        
+        {% if not session.get('user_id') %}
+            <!-- Guest UI - login/register forms would be here -->
+            <div style="margin-top:20px;" class="card">
+                <p style="color:var(--text-muted);">Explore our documentation or contact support if you need help.</p>
+            </div>
+            <div style="margin-top:18px; text-align:left; display:inline-block; color:var(--text-muted);">
+                <h3 style="color:var(--text-gold);">How to Play</h3>
+                <ul>
+                    <li>Create your free account</li>
+                    <li>Login to access games</li>
+                    <li>Play with just Ksh. 1.00 per round</li>
+                    <li>Win exciting cash prizes</li>
+                </ul>
+            </div>
+            <div class="features-grid" style="margin-top:20px;">
+                <div class="feature-card">
+                    <div style="font-size:1.6rem;">💰</div>
+                    <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Win Real Cash</div>
+                    <div style="color:var(--text-muted); margin-top:6px;">Play with just Ksh. 1.00 and win exciting cash prizes</div>
+                </div>
+                <div class="feature-card">
+                    <div style="font-size:1.6rem;">⚡</div>
+                    <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Fast Games</div>
+                    <div style="color:var(--text-muted); margin-top:6px;">New games every 30 seconds with instant results</div>
+                </div>
+                <div class="feature-card">
+                    <div style="font-size:1.6rem;">🛡️</div>
+                    <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Secure & Safe</div>
+                    <div style="color:var(--text-muted); margin-top:6px;">Advanced security with fair gameplay guaranteed</div>
+                </div>
+                <div class="feature-card">
+                    <div style="font-size:1.6rem;">🏆</div>
+                    <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Community</div>
+                    <div style="color:var(--text-muted); margin-top:6px;">Join thousands of players winning together</div>
+                </div>
+            </div>
+        {% else %}
+            <!-- Logged-in UI -->
+            <div style="text-align:center; margin-bottom:14px;">
+                <p style="font-size:1.1rem; color:var(--text-gold); font-weight:700;">Welcome back, {{ session.get('username') }}! 👋</p>
+            </div>
+
+            <!-- Game status & recent results -->
+            <div class="game-window">
+                <h2>Game Status</h2>
+                <p><strong>Next Game:</strong> <span id="next-game">Loading...</span></p>
+
+                <h2 style="margin-top:18px;">Recent Results (Last 50 Games)</h2>
+                <div id="game-results">
+                    Loading recent games...
+                </div>
+            </div>
+        {% endif %}        
+
+        <!-- Offline Content (hidden/shown via JS) -->
+        <div id="offlineBanner" class="offline-banner" style="display:none;">
+            <h3>📶 You're Offline - But the Fun Continues!</h3>
+            <p>Try these activities while you reconnect:</p>
+        </div>
+
+        <div id="offlineEntertainment" style="display:none;">
+            <div class="game-window">
+                <h2>🎮 {% if session.get('user_id') %}Offline Training Zone{% else %}Offline Fun Zone{% endif %}</h2>
+                <div class="offline-options" style="display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:12px;">
+                    <button class="offline-btn" onclick="startTriviaGame()">🧠 {% if session.get('user_id') %}Harambee Trivia{% else %}Trivia Challenge{% endif %}</button>
+                    <button class="offline-btn" onclick="showGamingTips()">📚 {% if session.get('user_id') %}Winning Strategies{% else %}Gaming Tips{% endif %}</button>
+                    <button class="offline-btn" onclick="showPracticeMode()">💪 {% if session.get('user_id') %}Practice Games{% else %}Practice Strategies{% endif %}</button>
+                    {% if session.get('user_id') %}
+                    <button class="offline-btn" onclick="viewAchievements()">🏆 My Achievements</button>
+                    {% endif %}
+                </div>
+                <div id="offlineContent" style="margin-top:14px;"></div>
+            </div>
+        </div>
+    </div> <!-- /.container -->
+
+    <!-- Footer -->
+    <div class="footer">
+        <p>
+            <a href="{{ url_for('terms') }}" style="color:var(--text-gold); text-decoration:none;">Terms & Conditions</a> |
+            <a href="{{ url_for('privacy') }}" style="color:var(--text-gold); text-decoration:none;">Privacy Policy</a> |
+            <a href="{{ url_for('docs') }}" style="color:var(--text-gold); text-decoration:none;">Documentation</a>
+        </p>
+
+        <div style="display:flex; justify-content:center; gap:12px; margin-top:12px;">
+            <a href="https://m.facebook.com/jamesboyid.ochuna" target="_blank" title="Facebook" style="display:inline-block;">
+                <img src="https://upload.wikimedia.org/wikipedia/commons/5/51/Facebook_f_logo_%282019%29.svg" alt="Facebook" style="height:28px; width:auto;" />
+            </a>
+            <a href="https://wa.me/254701207062" target="_blank" title="WhatsApp" style="display:inline-block;">
+                <img src="https://upload.wikimedia.org/wikipedia/commons/6/6b/WhatsApp.svg" alt="WhatsApp" style="height:28px; width:auto;" />
+            </a>
+            <a href="tel:+254701207062" title="Call Us" style="display:inline-block;">
+                <img src="https://upload.wikimedia.org/wikipedia/commons/8/8c/Phone_font_awesome.svg" alt="Phone" style="height:28px; width:auto;" />
+            </a>
+        </div>
+
+        <p style="margin-top:16px; color:var(--text-muted);">© 2025 Pigasimu. All rights reserved.</p>
+    </div>
+
+<!DOCTYPE html>
+<html>
+<head>
+    <!-- Your head content here -->
+</head>
+<body>
+    <!-- Your body content here -->
+
+    <!-- Game Animation Overlay -->
+    <script>
+        class UltimatePlayExperience {
+            constructor() {
+                this.isSubmitting = false;
+                this.init();
+            }
+
+            init() {
+                const form = document.getElementById('playForm');
+                const button = document.getElementById('playButton');
+        
+                if (!form || !button) {
+                    console.error('Play form or button not found!');
+                    return;
+                }
+
+                form.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    await this.handlePlaySubmission();
+                });
+            }
+
+            async handlePlaySubmission() {
+                if (this.isSubmitting) return;
+        
+                const button = document.getElementById('playButton');
+                const originalText = button.innerHTML;
+        
+                try {
+                    this.isSubmitting = true;
+                    button.disabled = true;
+                    button.innerHTML = '🚀 LAUNCHING...';
+            
+                    this.showLaunchAnimation();
+            
+                    const response = await fetch('/play', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        body: new URLSearchParams({
+                            'csrf_token': document.querySelector('input[name="csrf_token"]').value
+                        })
+                    });
+            
+                    const data = await response.json();
+            
+                    if (data.success) {
+                        await this.handleSuccess(data);
+                    } else {
+                        this.handleError(data.error);
+                    }
+            
+                } catch (error) {
+                    this.handleError('Network error. Please check your connection.');
+                } finally {
+                    this.isSubmitting = false;
+                    button.disabled = false;
+                    button.innerHTML = originalText;
+                }
+            }
+
+            async handleSuccess(data) {
+                const walletBadge = document.querySelector('.wallet-badge');
+                if (walletBadge && data.new_balance !== undefined) {
+                    walletBadge.textContent = `Ksh. ${data.new_balance.toFixed(2)}`;
+                }
+        
+                await this.showEpicSuccessAnimation();
+                this.showFloatingMessage(data.message, 'success');
+                this.playVictorySound();
+                setTimeout(() => this.fetchGameData(), 1000);
+            }
+
+            handleError(error) {
+                this.showFloatingMessage(error, 'error');
+                this.playErrorSound();
+            }
+
+            showLaunchAnimation() {
+                const rocket = document.createElement('div');
+                rocket.innerHTML = '🚀';
+                rocket.style.cssText = `
+                    position: fixed;
+                    bottom: 20px;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    font-size: 4rem;
+                    z-index: 10000;
+                    animation: rocketLaunch 2s ease-out forwards;
+                `;
+
+                document.body.appendChild(rocket);
+                setTimeout(() => rocket.remove(), 2000);
+            }
+
+            async showEpicSuccessAnimation() {
+                this.createConfetti();
+        
+                const successDiv = document.createElement('div');
+                successDiv.innerHTML = `
+                    <div style="
+                        position: fixed;
+                        top: 50%;
+                        left: 50%;
+                        transform: translate(-50%, -50%);
+                        background: linear-gradient(135deg, #FFD700, #D4AF37);
+                        color: #000;
+                        padding: 30px 40px;
+                        border-radius: 20px;
+                        font-size: 1.5rem;
+                        font-weight: bold;
+                        text-align: center;
+                        z-index: 10001;
+                        box-shadow: 0 0 50px rgba(255, 215, 0, 0.8);
+                        animation: popIn 0.5s ease-out;
+                    ">
+                        <div style="font-size: 3rem; margin-bottom: 10px;">🎉</div>
+                        ENROLLED SUCCESSFULLY!
+                        <div style="font-size: 1rem; margin-top: 10px;">Get ready to win big! 🚀</div>
+                    </div>
+                `;
+        
+                document.body.appendChild(successDiv);
+        
+                setTimeout(() => {
+                    successDiv.style.animation = 'popOut 0.5s ease-in forwards';
+                    setTimeout(() => successDiv.remove(), 500);
+                }, 3000);
+            }
+
+            createConfetti() {
+                const colors = ['#FFD700', '#D4AF37', '#FF6B35', '#00C9B1', '#FFD166'];
+                for (let i = 0; i < 50; i++) {
+                    setTimeout(() => {
+                        const confetti = document.createElement('div');
+                        confetti.innerHTML = ['🎉', '🎊', '⭐', '💫', '✨'][Math.floor(Math.random() * 5)];
+                        confetti.style.cssText = `
+                            position: fixed;
+                            top: 100%;
+                            left: ${Math.random() * 100}%;
+                            font-size: ${Math.random() * 20 + 10}px;
+                            z-index: 10000;
+                            animation: confettiFall ${Math.random() * 3 + 2}s linear forwards;
+                         `;
+                
+                        document.body.appendChild(confetti);
+                        setTimeout(() => confetti.remove(), 5000);
+                    }, i * 100);
+                }
+            }
+
+            showFloatingMessage(message, type) {
+                const messageDiv = document.createElement('div');
+                messageDiv.textContent = message;
+                messageDiv.style.cssText = `
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    background: ${type === 'success' ? 'linear-gradient(135deg, #00C9B1, #00A896)' : 'linear-gradient(135deg, #FF6B35, #E63946)'};
+                    color: white;
+                    padding: 15px 20px;
+                    border-radius: 10px;
+                    font-weight: bold;
+                    z-index: 10002;
+                    animation: slideInRight 0.5s ease-out;
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+                `;
+        
+                document.body.appendChild(messageDiv);
+        
+                setTimeout(() => {
+                    messageDiv.style.animation = 'slideOutRight 0.5s ease-in forwards';
+                    setTimeout(() => messageDiv.remove(), 500);
+                }, 4000);
+            }
+
+            playVictorySound() {
+                try {
+                    const context = new (window.AudioContext || window.webkitAudioContext)();
+                    const oscillator = context.createOscillator();
+                    const gain = context.createGain();
+            
+                    oscillator.connect(gain);
+                    gain.connect(context.destination);
+            
+                    oscillator.frequency.setValueAtTime(523.25, context.currentTime);
+                    oscillator.frequency.setValueAtTime(659.25, context.currentTime + 0.1);
+                    oscillator.frequency.setValueAtTime(783.99, context.currentTime + 0.2);
+                    oscillator.frequency.setValueAtTime(1046.50, context.currentTime + 0.3);
+            
+                    oscillator.type = 'sine';
+                    gain.gain.setValueAtTime(0.1, context.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, context.currentTime + 0.5);
+            
+                    oscillator.start();
+                    oscillator.stop(context.currentTime + 0.5);
+                } catch (e) {
+                    // Audio not supported
+                }
+            }
+
+            playErrorSound() {
+                try {
+                    const context = new (window.AudioContext || window.webkitAudioContext)();
+                    const oscillator = context.createOscillator();
+                    const gain = context.createGain();
+            
+                    oscillator.connect(gain);
+                    gain.connect(context.destination);
+            
+                    oscillator.frequency.setValueAtTime(200, context.currentTime);
+                    oscillator.type = 'sawtooth';
+                    gain.gain.setValueAtTime(0.1, context.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, context.currentTime + 0.3);
+            
+                    oscillator.start();
+                    oscillator.stop(context.currentTime + 0.3);
+                } catch (e) {
+                    // Audio not supported
+                }
+            }
+
+            async fetchGameData() {
+                try {
+                    const response = await fetch('/game_data');
+                    const data = await response.json();
+            
+                    if (data.current_user_queued) {
+                        this.updateQueueStatus();
+                    }
+                } catch (error) {
+                    console.error('Failed to fetch game data:', error);
+                }
+            }
+
+            updateQueueStatus() {
+                const button = document.getElementById('playButton');
+                if (button) {
+                    button.innerHTML = '✅ ENROLLED!';
+                    button.disabled = true;
+                    button.style.background = 'linear-gradient(135deg, #00C9B1, #00A896)';
+                }
+            }
+        }
+
+        // Add CSS animations
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes rocketLaunch {
+                0% { transform: translateX(-50%) translateY(0) scale(1); opacity: 1; }
+                100% { transform: translateX(-50%) translateY(-100vh) scale(0.5); opacity: 0; }
+            }
+    
+            @keyframes confettiFall {
+                0% { transform: translateY(0) rotate(0deg); opacity: 1; }
+                100% { transform: translateY(-100vh) rotate(360deg); opacity: 0; }
+            }
+    
+            @keyframes popIn {
+                0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+                80% { transform: translate(-50%, -50%) scale(1.1); opacity: 1; }
+                100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+            }
+    
+            @keyframes popOut {
+                0% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+                100% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+            }
+    
+            @keyframes slideInRight {
+                0% { transform: translateX(100%); opacity: 0; }
+                100% { transform: translateX(0); opacity: 1; }
+            }
+
+            @keyframes slideOutRight {
+                0% { transform: translateX(0); opacity: 1; }
+                100% { transform: translateX(100%); opacity: 0; }
+            }
+        `;
+        document.head.appendChild(style);
+
+        document.addEventListener('DOMContentLoaded', function() {
+            new UltimatePlayExperience();
+            console.log('🎮 Ultimate Play Experience Activated!');
+        });
+    </script>
+
+    <!-- Offline Features: Trivia Game -->
+    <script>
+        const triviaQuestions = [
+            { question: "What is the minimum play amount in Harambee Cash?", options: ["Ksh. 1","Ksh. 5","Ksh. 10","Ksh. 20"], answer: 0 },
+            { question: "How often do games run in Harambee Cash?", options: ["Every 5 minutes","Every 30 seconds","Every hour","Once a day"], answer: 1 },
+            { question: "What should you do before playing any game?", options: ["Set a budget","Borrow money","Play continuously","Ignore rules"], answer: 0 },
+            { question: "Which is a good gaming practice?", options: ["Take regular breaks","Chase losses","Play when emotional","Ignore time"], answer: 0 }
+        ];
+
+        let currentTriviaQuestion = 0;
+        let triviaScore = 0;
+
+        function startTriviaGame() {
+            currentTriviaQuestion = 0;
+            triviaScore = 0;
+            showTriviaQuestion();
+        }
+
+        function showTriviaQuestion() {
+            if (currentTriviaQuestion >= triviaQuestions.length) { 
+                endTriviaGame(); 
+                return; 
+            }
+            const q = triviaQuestions[currentTriviaQuestion];
+            let html = `<h3>🧠 Question ${currentTriviaQuestion + 1}/${triviaQuestions.length}</h3>
+                        <p style="font-size:1.1rem; margin:12px 0;">${q.question}</p>
+                        <div id="triviaOptions">`;
+            q.options.forEach((opt, idx) => {
+                html += `<div class="trivia-option" onclick="checkTriviaAnswer(${idx})">${opt}</div>`;
+            });
+            html += `</div><p style="margin-top:12px;">Score: ${triviaScore}</p>`;
+            const out = document.getElementById('offlineContent');
+            if (out) out.innerHTML = html;
+        }
+
+        function checkTriviaAnswer(selectedIndex) {
+            const question = triviaQuestions[currentTriviaQuestion];
+            const options = document.querySelectorAll('.trivia-option');
+            options.forEach((option, index) => {
+                if (index === question.answer) option.classList.add('trivia-correct');
+                else if (index === selectedIndex && index !== question.answer) option.classList.add('trivia-wrong');
+                option.style.pointerEvents = 'none';
+            });
+            if (selectedIndex === question.answer) { 
+                triviaScore++; 
+                playSoundFeedback(true); 
+            } else { 
+                playSoundFeedback(false); 
+            }
+            setTimeout(() => { 
+                currentTriviaQuestion++; 
+                showTriviaQuestion(); 
+            }, 1200);
+        }
+
+        function playSoundFeedback(isCorrect) {
+            try {
+                if (!window.submissionProtector || !window.submissionProtector.audioEnabled) return;
+                const context = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = context.createOscillator();
+                const gain = context.createGain();
+                osc.connect(gain); 
+                gain.connect(context.destination);
+                osc.frequency.value = isCorrect ? 800 : 300;
+                osc.type = 'sine';
+                gain.gain.setValueAtTime(0.3, context.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, context.currentTime + 0.4);
+                osc.start(context.currentTime);
+                osc.stop(context.currentTime + 0.4);
+            } catch (e) { 
+                console.log('Audio not supported', e); 
+            }
+        }
+
+        function endTriviaGame() {
+            let msg = '';
+            if (triviaScore === triviaQuestions.length) { 
+                msg = "🎉 Perfect! You're a Harambee Cash expert!"; 
+                unlockAchievement('trivia_master'); 
+            } else if (triviaScore >= triviaQuestions.length / 2) { 
+                msg = "👍 Great job! You know your stuff!"; 
+            } else { 
+                msg = "💪 Keep learning! Read the tips to improve!"; 
+            }
+            const out = document.getElementById('offlineContent');
+            if (out) out.innerHTML = `<div style="text-align:center; padding:20px;"><h3>🏆 Trivia Complete!</h3><p>Final Score: ${triviaScore}/${triviaQuestions.length}</p><p>${msg}</p><button class="offline-btn" onclick="startTriviaGame()">Play Again</button></div>`;
+        }
+    </script>
+
+    <!-- Offline Features: Gaming Tips -->
+    <script>
+        function showGamingTips() {
+            const tips = [
+                "💰 Set a budget before you start playing and stick to it",
+                "⏰ Take regular breaks - don't play for more than 1 hour continuously",
+                "🎯 Understand the game rules completely before playing",
+                "💡 Never chase losses - if you're losing, take a break",
+                "📊 Keep track of your wins and losses",
+                "🎮 Remember: Gaming should be fun, not a source of income",
+                "🔄 Try different strategies in practice mode first",
+                "📱 Install the app for better experience and notifications"
+            ];
+            let html = '<h3>📚 Smart Gaming Tips</h3><ul style="text-align:left; margin-top:10px;">';
+            tips.forEach(t => { 
+                html += `<li style="margin:8px 0; padding:8px; background:rgba(0,201,177,0.06); border-radius:8px;">${t}</li>`; 
+            });
+            html += '</ul><div style="text-align:center; margin-top:12px;"><button class="offline-btn" onclick="showPracticeMode()">Next: Practice Strategies</button></div>';
+            const out = document.getElementById('offlineContent'); 
+            if (out) out.innerHTML = html; 
+            unlockAchievement('knowledge_seeker');
+        }
+
+        function showPracticeMode() {
+            const html = `<div style="text-align:center;">
+                <h3>💪 Practice Strategies</h3>
+                <div style="text-align:left; margin-top:12px;">
+                    <div class="game-result"><h4>Scenario 1: Winning Streak</h4><p>You've won 3 games in a row. What should you do?</p><p><em>Answer: Consider taking a break or setting aside some winnings.</em></p></div>
+                    <div class="game-result"><h4>Scenario 2: Losing Streak</h4><p>You've lost 5 consecutive games. Your next move?</p><p><em>Answer: Take a break, don't chase losses. Come back fresh later.</em></p></div>
+                    <div class="game-result"><h4>Scenario 3: Budget Management</h4><p>You've reached your daily budget limit but want to play more.</p><p><em>Answer: Stop playing. Stick to your budget always.</em></p></div>
+                </div>
+                <div style="margin-top:12px;"><button class="offline-btn" onclick="startTriviaGame()">Test Your Knowledge</button></div>
+            </div>`;
+            const out = document.getElementById('offlineContent'); 
+            if (out) out.innerHTML = html;
+        }
+    </script>
+
+    <!-- Offline Features: Achievements System -->
+    <script>
+        const achievements = {
+            'offline_explorer': { name: 'Offline Explorer', description: 'Used the app while offline', unlocked: false },
+            'trivia_master':   { name: 'Trivia Master',   description: 'Got perfect score in trivia', unlocked: false },
+            'knowledge_seeker':{ name: 'Knowledge Seeker',description: 'Read all gaming tips', unlocked: false },
+            'app_installer':   { name: 'App Installer',   description: 'Installed the PWA app', unlocked: false }
+        };
+
+        function unlockAchievement(id) {
+            if (achievements[id] && !achievements[id].unlocked) {
+                achievements[id].unlocked = true;
+                showAchievementNotification(achievements[id].name);
+                try { 
+                    localStorage.setItem('harambeeAchievements', JSON.stringify(achievements)); 
+                } catch(e){}
+            }
+        }
+
+        function showAchievementNotification(name) {
+            const n = document.createElement('div');
+            n.className = 'achievement-notification';
+            n.innerHTML = `<div style="text-align:center;"><div style="font-size:1.4rem;">🏆</div><h4 style="margin:6px 0;">Achievement Unlocked!</h4><div>${name}</div></div>`;
+            document.body.appendChild(n);
+            setTimeout(() => { 
+                n.style.opacity = '0'; 
+                setTimeout(()=>{ 
+                    if (n.parentNode) n.parentNode.removeChild(n); 
+                }, 500); 
+            }, 3000);
+        }
+
+        function viewAchievements() {
+            let html = '<h3>🏆 My Achievements</h3><div style="text-align:left;">';
+            Object.keys(achievements).forEach(k => {
+                const a = achievements[k];
+                html += `<div style="padding:12px; margin:8px 0; background:${a.unlocked ? 'rgba(0,201,177,0.12)' : 'rgba(0,0,0,0.12)'}; border-radius:10px;">
+                    <strong>${a.unlocked ? '✅' : '🔒'} ${a.name}</strong>
+                    <p style="margin:6px 0 0 0; font-size:0.9rem;">${a.description}</p>
+                </div>`;
+            });
+            html += '</div>';
+            const out = document.getElementById('offlineContent'); 
+            if (out) out.innerHTML = html;
+        }
+
+        function saveAchievements() {
+            try { 
+                localStorage.setItem('harambeeAchievements', JSON.stringify(achievements)); 
+            } catch(e){}
+        }
+
+        function loadAchievements() {
+            try {
+                const s = localStorage.getItem('harambeeAchievements');
+                if (s) {
+                    const loaded = JSON.parse(s);
+                    Object.keys(loaded).forEach(k => { 
+                        if (achievements[k]) achievements[k].unlocked = loaded[k].unlocked; 
+                    });
+                }
+            } catch(e) { 
+                console.error('Error loading achievements', e); 
+            }
+        }
+    </script>
+
+    <!-- Network Status Handler -->
+    <script>
+        function updateOnlineStatusUI() {
+            const offlineBanner = document.getElementById('offlineBanner');
+            const offlineEntertainment = document.getElementById('offlineEntertainment');
+            if (!navigator.onLine) {
+                if (offlineBanner) offlineBanner.style.display = 'block';
+                if (offlineEntertainment) offlineEntertainment.style.display = 'block';
+                unlockAchievement('offline_explorer');
+            } else {
+                if (offlineBanner) offlineBanner.style.display = 'none';
+                if (offlineEntertainment) offlineEntertainment.style.display = 'none';
+            }
+        }
+    </script>
+
+    <!-- Game Status Updater -->
+    <script>
+        class GameStatusUpdater {
+            constructor() {
+                this.eventSource = null;
+                this.init();
+            }
+
+            init() {
+                this.startEventSource();
+                this.fetchGameData();
+                setInterval(() => this.fetchGameData(), 5000);
+            }
+
+            startEventSource() {
+                try {
+                    this.eventSource = new EventSource('/stream');
+                    
+                    this.eventSource.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        this.updateGameDisplay(data);
+                    };
+
+                    this.eventSource.onerror = (error) => {
+                        console.error('EventSource error:', error);
+                        setTimeout(() => this.startEventSource(), 5000);
+                    };
+                } catch (error) {
+                    console.error('Failed to start EventSource:', error);
+                }
+            }
+
+            async fetchGameData() {
+                try {
+                    const response = await fetch('/game_data');
+                    const data = await response.json();
+                    this.updateGameDisplay(data);
+                } catch (error) {
+                    console.error('Error fetching game data:', error);
+                    document.getElementById('next-game').textContent = 'Error loading game data';
+                    document.getElementById('game-results').innerHTML = '<p style="color:var(--text-muted);">Error loading recent games</p>';
+                }
+            }
+
+            updateGameDisplay(data) {
+                const nextGameElem = document.getElementById('next-game');
+                if (nextGameElem && data.upcoming_game) {
+                    nextGameElem.textContent = `${data.upcoming_game.game_code} at ${data.upcoming_game.timestamp}`;
+                }
+
+                const resultsContainer = document.getElementById('game-results');
+                if (resultsContainer && data.completed_games) {
+                    if (data.completed_games.length > 0) {
+                        let html = '';
+                        data.completed_games.forEach(game => {
+                            html += `
+                                <div class="game-result">
+                                    <p><strong>🎯 Game Code:</strong> ${game.game_code}</p>
+                                    <p><strong>🕒 Timestamp:</strong> ${game.timestamp}</p>
+                                    <p><strong>👥 Players:</strong> ${game.num_users}</p>
+                                    <p><strong>💰 Total Amount:</strong> ${game.total_amount}</p>
+                                    <p><strong>🏆 Winner:</strong> ${game.winner}</p>
+                                    <p><strong>🎁 Win Amount:</strong> ${game.winner_amount}</p>
+                                    <p><strong>📊 Outcome:</strong> ${game.outcome_message}</p>
+                                </div>
+                            `;
+                        });
+                        resultsContainer.innerHTML = html;
+                    } else {
+                        resultsContainer.innerHTML = '<p style="color:var(--text-muted);">No recent completed games.</p>';
+                    }
+                }
+
+                const playButton = document.getElementById('playButton');
+                if (playButton) {
+                    if (data.current_user_queued) {
+                        playButton.innerHTML = '✅ ENROLLED!';
+                        playButton.disabled = true;
+                        playButton.style.background = 'linear-gradient(135deg, #00C9B1, #00A896)';
+                    } else {
+                        playButton.innerHTML = '🎮 PLAY NOW & WIN BIG!';
+                        playButton.disabled = false;
+                        playButton.style.background = 'var(--gold-gradient)';
+                    }
+                }
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            new GameStatusUpdater();
+        });
+        
+        fetch('/game_data').then(r => r.json()).then(console.log);
+    </script>
+
+    <!-- Game Status Watcher -->
+    <script>
+        let lastGameStatus = '';
+
+        function watchGameStatus() {
+            setInterval(() => {
+                fetch('/api/game/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.status === 'success' && lastGameStatus !== 'success') {
+                            document.getElementById('gameEndSound').play().catch(() => {});
+                            lastGameStatus = 'success';
+                        } else if (data.status !== 'success') {
+                            lastGameStatus = '';
+                        }
+                    })
+                    .catch(() => {});
+            }, 2000);
+        }
+
+        document.addEventListener('DOMContentLoaded', watchGameStatus);
+    </script>
+
+    <!-- Message Cleanup -->
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            setTimeout(() => {
+                const messages = document.querySelectorAll('.card');
+                messages.forEach(message => {
+                    if (message.textContent.includes('Please log in') || 
+                        message.textContent.includes('Access denied')) {
+                        message.remove();
+                    }
+                });
+            }, 5000);
+        });
+    </script>
+
+    <!-- PWA Service Worker -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                navigator.serviceWorker.register('{{ url_for("static", filename="service-worker.js") }}')
+                    .then(function(registration) {
+                        console.log('ServiceWorker registered successfully: ', registration.scope);
+                    })
+                    .catch(function(error) {
+                        console.log('ServiceWorker registration failed: ', error);
+                    });
+            });
+        }
+    </script>
+
+    <!-- PWA Install Prompt -->
+    <script>
+        let deferredPrompt;
+        const installBtn = document.getElementById('install-btn');
+
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            deferredPrompt = e;
+            if (installBtn) {
+                installBtn.style.display = 'block';
+                installBtn.addEventListener('click', async () => {
+                    if (!deferredPrompt) return;
+                    deferredPrompt.prompt();
+                    const { outcome } = await deferredPrompt.userChoice;
+                    if (outcome === 'accepted') {
+                        console.log('PWA installed');
+                        installBtn.style.display = 'none';
+                    }
+                    deferredPrompt = null;
+                });
+            }
+        });
+
+        window.addEventListener('appinstalled', () => {
+            console.log('PWA was installed');
+            if (installBtn) installBtn.style.display = 'none';
+            deferredPrompt = null;
+        });
+    </script>
+
+    <!-- Main Initialization -->
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Instantiate protector and expose globally
+            window.submissionProtector = new SubmissionProtector();
+            submissionProtector.initialize();
+
+            // Load achievements
+            loadAchievements();
+                        
+            // Network status events
+            window.addEventListener('online', updateOnlineStatusUI);
+            window.addEventListener('offline', updateOnlineStatusUI);
+            updateOnlineStatusUI();
+
+            // Timestamp display
+            function updateLocalTime() {
+                try {
+                    const time = new Date();
+                    const formatter = new Intl.DateTimeFormat('en-KE', {
+                        dateStyle: 'full',
+                        timeStyle: 'medium',
+                        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                        hour12: false
+                    });
+                    let ts = document.getElementById('timestamp-display');
+                    if (!ts) {
+                        ts = document.createElement('div');
+                        ts.id = 'timestamp-display';
+                        ts.style.textAlign = 'center';
+                        ts.style.margin = '10px 0';
+                        ts.style.color = 'var(--text-muted)';
+                        const container = document.querySelector('.container');
+                        if (container) container.insertBefore(ts, container.firstChild);
+                    }
+                    ts.textContent = `🕒 ${formatter.format(time)}`;
+                } catch (e) { 
+                    console.error(e); 
+                }
+            }
+            updateLocalTime();
+            setInterval(updateLocalTime, 1000);
+
+            // Auto-clear flash messages after 9s
+            setTimeout(() => {
+                const cards = document.querySelectorAll('.card');
+                cards.forEach(c => {
+                    if (c.parentNode && c.parentNode === document.querySelector('.container')) {
+                        // Keep main cards
+                    }
+                });
+            }, 9000);
+
+            // URL param handlers for form feedback
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.has('message')) {
+                const msg = urlParams.get('message');
+                if (msg && (msg.toLowerCase().includes('success') || msg.toLowerCase().includes('enrolled') || msg.toLowerCase().includes('already enrolled'))) {
+                    submissionProtector.handleSubmissionSuccess(msg);
+                }
+            }
+            if (urlParams.has('error')) {
+                submissionProtector.handleSubmissionError();
+            }
+
+            // Load achievements from storage
+            loadAchievements();
+
+            // If user is logged in, fetch game data periodically
+            {% if session.get('user_id') %}
+            function fetchGameData() {
+                fetch("/game_data")
+                    .then(response => {
+                        if (!response.ok) throw new Error('Network response was not ok');
+                        return response.json();
+                    })
+                    .then(data => {
+                        const nextElem = document.getElementById("next-game");
+                        if (nextElem) {
+                            if (data.upcoming_game && data.upcoming_game.game_code && data.upcoming_game.timestamp) {
+                                nextElem.textContent = `${data.upcoming_game.game_code} at ${data.upcoming_game.timestamp} (${data.upcoming_game.outcome_message || ''})`;
+                            } else {
+                                nextElem.textContent = "No active game";
+                            }
+                        }
+
+                        const resultsContainer = document.getElementById("game-results");
+                        if (resultsContainer) {
+                            resultsContainer.innerHTML = "";
+                            if (Array.isArray(data.completed_games) && data.completed_games.length) {
+                                data.completed_games.forEach(game => {
+                                    const div = document.createElement('div');
+                                    div.className = 'game-result';
+                                    div.innerHTML = `
+                                        <p><strong>🎯 Game Code:</strong> ${game.game_code}</p>
+                                        <p><strong>🕒 Timestamp:</strong> ${game.timestamp}</p>
+                                        <p><strong>👥 Players:</strong> ${game.num_users}</p>
+                                        <p><strong>💰 Total Amount:</strong> ${game.total_amount}</p>
+                                        <p><strong>🏆 Winner:</strong> ${game.winner}</p>
+                                        <p><strong>🎁 Win Amount:</strong> ${game.winner_amount}</p>
+                                        <p><strong>📊 Outcome:</strong> ${game.outcome_message}</p>
+                                    `;
+                                    resultsContainer.appendChild(div);
+                                });
+                            } else {
+                                resultsContainer.innerHTML = '<p style="color:var(--text-muted);">No recent completed games.</p>';
+                            }
+                        }
+
+                        if (data.current_user_queued && window.submissionProtector) {
+                            submissionProtector.handleSubmissionSuccess('✅ Already enrolled in current game');
+                        }
+                    })
+                    .catch(err => {
+                        console.error("Error fetching game data:", err);
+                        const nextElem = document.getElementById("next-game");
+                        if (nextElem) nextElem.textContent = "Error loading game data";
+                    });
+            }
+
+            fetchGameData();
+            setInterval(fetchGameData, 9000);
+
+            window.gameAnimator = new GameAnimator();
+            window.gameAnimator.monitorGameStatus();
+            {% endif %}
+
+            window.handlePlayClick = function(event) {
+                if (window.submissionProtector && (window.submissionProtector.isSubmitting || window.submissionProtector.userEnrolled)) {
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    if (window.submissionProtector.isSubmitting) {
+                        window.submissionProtector.showTemporaryMessage('⏳ Processing your previous request...', 'warning');
+                    } else {
+                        window.submissionProtector.showTemporaryMessage('✅ Already enrolled in current game!', 'success');
+                    }
+                    return false;
+                }
+                const button = event.target;
+                if (button && button.disabled) { 
+                    event.preventDefault(); 
+                    return false; 
+                }
+                if (button) { 
+                    button.disabled = true; 
+                    button.innerHTML = '🎮 PROCESSING...'; 
+                }
+
+                const ga = window.gameAnimator || null;
+                if (ga && ga.playGameStart) {
+                    ga.playGameStart('...');
+                } else {
+                    const anim = document.getElementById('gameAnimation');
+                    const text = document.getElementById('animationText');
+                    if (anim && text) {
+                        text.textContent = 'Processing your play...';
+                        anim.style.display = 'flex';
+                        setTimeout(()=>{ anim.style.display = 'none'; }, 1500);
+                    }
+                }
+
+                setTimeout(() => {
+                    if (button) { 
+                        button.disabled = false; 
+                        button.innerHTML = '🎮 PLAY NOW & WIN BIG!'; 
+                    }
+                }, 3000);
+
+                return true;
+            };
+
+            updateOnlineStatusUI();
+        });
+    </script>
 </body>
 </html>
 """
@@ -2257,2733 +4031,801 @@ mpesa_payment_html = """
 register_html = """<!DOCTYPE html>
 <html lang="en">
 <head>
-  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
-     crossorigin="anonymous"></script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Harambee Cash</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" />
+    <style>
+        body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #a8edea, #fed6e3); display:flex; align-items:center; justify-content:center; height:100vh; margin:0; color:#333; }
+        .register-container { background:#ffffffee; padding:30px; border-radius:20px; box-shadow:0 6px 20px rgba(0,0,0,0.2); max-width:400px; width:90%; }
+        h2 { color:#4caf50; margin-bottom:20px; font-size:1.8rem; text-align:center; }
+        .error { color:#e53935; text-align:center; margin-bottom:10px; }
+        .message { color:#43a047; text-align:center; margin-bottom:10px; }
+        label { display:block; margin-bottom:5px; color:#4caf50; }
+        input { width:100%; padding:12px; margin-bottom:15px; border:2px solid #4caf50; border-radius:8px; background:#f9fff9; }
+        button { width:100%; padding:12px; background:#4caf50; border:none; color:white; font-weight:bold; border-radius:10px; cursor:pointer; transition:background 0.3s ease; }
+        button:hover { background:#388e3c; }
+        .back-link { text-align:center; margin-top:15px; }
+        .back-link a { color:#4caf50; text-decoration:none; font-weight:bold; }
+    </style>
+</head>
+<body>
+    <div class="register-container">
+        <h2>Create Account</h2>
+
+        {% if error %}<p class="error">{{ error }}</p>{% endif %}
+        {% if message %}<p class="message">{{ message }}</p>{% endif %}
+
+        <form method="POST" action="/register">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="email">Email:</label>
+            <input type="email" name="email" id="email" required />
+
+            <label for="username">Username (Tel Number):</label>
+            <input type="text" name="username" id="username" required />
+
+            <label for="password">Password:</label>
+            <input type="password" name="password" id="password" required />
+
+            <button type="submit">Register</button>
+        </form>
+
+        <div class="back-link">
+            <p>Already have an account? <a href="/login">Login</a></p>
+            <p><a href="/">â† Back to Home</a></p>
+        </div>      
+    </div>
+</body>
+</html>
+"""
+
+login_html = """  
+<!DOCTYPE html>  
+<html lang="en">  
+<head>  
+    <meta charset="UTF-8">  
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">  
+    <title>Login - HARAMBEE CASH!</title>  
+    <style>  
+        body { font-family: Arial, sans-serif; margin:0; padding:0; display:flex; justify-content:center; align-items:center; min-height:100vh; background:linear-gradient(to right,#ff7e5f,#feb47b); color:white; }
+        .container { width:90%; max-width:400px; padding:20px; background:rgba(0,0,0,0.8); border-radius:15px; text-align:center; box-sizing:border-box; }
+        h1 { font-size:1.8rem; margin-bottom:15px; color:#ffcc00; }
+        .error { color:#ffcccb; font-weight:bold; margin-bottom:10px; }
+        .message { color:#43a047; font-weight:bold; margin-bottom:10px; }
+        form { display:flex; flex-direction:column; gap:15px; }
+        label { font-size:1rem; text-align:left; color:#ffcccb; }
+        input, button { padding:10px; font-size:1rem; border-radius:5px; width:100%; box-sizing:border-box; }
+        input { border:1px solid #ccc; background:rgba(255,255,255,0.1); color:white; }
+        button { background-color:#4CAF50; color:white; cursor:pointer; border:none; transition:background-color 0.3s ease; font-weight:bold; }
+        button:hover { background-color:#45a049; }
+        a { color:#4CAF50; text-decoration:none; font-weight:bold; }
+        a:hover { color:#45a049; text-decoration:underline; }
+    </style>  
+</head>  
+<body>  
+    <div class="container">  
+        <h1>Login</h1>  
+        {% if error %} <p class="error">{{ error }}</p> {% endif %}  
+        {% if message %} <p class="message">{{ message }}</p> {% endif %}  
+        <form method="POST" action="/login" id="loginForm" autocomplete="on">  
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="username">Username:</label>  
+            <input type="text" id="username" name="username" required autocomplete="username" placeholder="Enter your username">  
+            <label for="password">Password:</label>  
+            <input type="password" id="password" name="password" required autocomplete="current-password" placeholder="Enter your password">  
+            <button type="submit">Login</button>  
+        </form>  
+        <p>Don't have an account? <a href="/register">Register</a></p>  
+    </div>  
+    <script>  
+        document.getElementById('loginForm').addEventListener('submit', function() {  
+            console.log('Login form submitted');  
+        });  
+        {% if session.get('user_id') %}  
+        setTimeout(function() {  
+            const form = document.getElementById('loginForm');  
+            if (form) { form.style.display = 'none'; console.log('Successful login detected'); }  
+        }, 500);  
+        {% endif %}  
+    </script>  
+</body>  
+</html>  
+"""
+
+admin_login_html = """  
+<!DOCTYPE html>  
+<html lang="en">  
+<head>  
+    <meta charset="UTF-8">  
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">  
+    <title>Admin Login - HARAMBEE CASH!</title>  
+    <style>  
+        body { font-family: Arial, sans-serif; margin:0; padding:0; display:flex; justify-content:center; align-items:center; min-height:100vh; background:linear-gradient(to right,#43cea2,#185a9d); color:white; }
+        .container { width:90%; max-width:400px; padding:20px; background:rgba(0,0,0,0.8); border-radius:15px; text-align:center; box-sizing:border-box; }
+        h1 { font-size:1.8rem; margin-bottom:15px; color:#ffcc00; }
+        .error { color:#ffcccb; font-weight:bold; margin-bottom:10px; }
+        form { display:flex; flex-direction:column; gap:15px; }
+        label { font-size:1rem; text-align:left; color:#ffcccb; }
+        input, button { padding:10px; font-size:1rem; border-radius:5px; width:100%; box-sizing:border-box; }
+        input { border:1px solid #ccc; background:rgba(255,255,255,0.1); color:white; }
+        button { background-color:#4CAF50; color:white; cursor:pointer; border:none; transition:background-color 0.3s ease; font-weight:bold; }
+        button:hover { background-color:#45a049; }
+    </style>  
+</head>  
+<body>  
+    <div class="container">  
+        <h1>Admin Login</h1>  
+        {% if error %} <p class="error">{{ error }}</p> {% endif %}  
+        <form method="POST" action="/admin/login" id="adminLoginForm" autocomplete="on">  
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="adminUsername">Username:</label>  
+            <input type="text" id="adminUsername" name="username" required autocomplete="username" placeholder="Admin username">  
+            <label for="adminPassword">Password:</label>  
+            <input type="password" id="adminPassword" name="password" required autocomplete="current-password" placeholder="Admin password">  
+            <button type="submit">Login</button>  
+        </form>  
+    </div>  
+    <script>  
+        document.getElementById('adminLoginForm').addEventListener('submit', function() { console.log('Admin login submitted'); });  
+    </script>  
+</body>  
+</html>  
+"""
+
+admin_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Soko Jirani Portals</title>
-    
+    <title>Admin - HARAMBEE CASH!</title>
     <style>
         body {
             font-family: Arial, sans-serif;
-            background-color: #4caf50; /* Green background color */
-            color: #ffffff;
-            text-align: center;
-            margin: 0;
-            padding: 0;
-        }
-        form {
-            background-color: #388e3c;
-            padding: 20px;
-            border-radius: 5px;
-            display: inline-block;
-        }
-        label {
-            display: block;
-            margin: 10px 0 5px;
-        }
-        input {
-            padding: 8px;
-            margin-bottom: 10px;
-            border-radius: 4px;
-            border: none;
-            width: 100%;
-        }
-        input[type="submit"] {
-            background-color: #1976d2;
-            color: #ffffff;
-            cursor: pointer;
-            width: 100%;
-        }
-        input[type="submit"]:hover {
-            background-color: #1565c0;
-        }
-        a {
-            display: block;
-            margin-top: 20px;
-            color: #ffffff;
-            text-decoration: none;
-            background-color: #1976d2;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        a:hover {
-            background-color: #1565c0;
-        }
-        ul {
-            list-style: none;
-            padding: 0;
-        }
-        li {
-            margin: 5px 0;
-            color: #ffcc00;
-        }
-    </style>
-</head>
-<body>
-    <h1>Register</h1>    
-    
-    <form method="post">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">  
-        <label for="username">Phone Number :</label>
-        <input type="text" name="username" required><br>
-        <label for="email">Email:</label>
-        <input type="email" name="email" required><br>
-        <label for="password">Password:</label>
-        <input type="password" name="password" required><br>
-        <label for="voucher">Voucher:</label>
-        <input type="text" name="voucher" required><br>
-        <input type="submit" value="Register">
-    </form>
-    <a href="{{ url_for('index') }}">Back to Home</a>
-    <a href="https://pigasimu.co.ke" class="button neutral">Back to Pigasimu Home</a>    
-    {% with messages = get_flashed_messages(with_categories=true) %}
-    {% if messages %}
-    <ul>
-        {% for category, message in messages %}
-        <li class="{{ category }}">{{ message }}</li>
-        {% endfor %}
-    </ul>
-    {% endif %}
-    {% endwith %}
-</body>
-</html>
-"""
-
-dashboard_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Mashamba na Nyumba Portal">
-   
-    <title>Dashboard</title>
-    <style>
-        body {
-            font-family: 'Helvetica Neue', Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: #f0f2f5;
-        }
-        .header {
-            background-color: #003366;
-            color: #ffffff;
-            padding: 15px;
-            text-align: center;
-            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
-        }
-        .header img {
-            max-width: 90px;
-            height: auto;
-            display: block;
-            margin: 0 auto 10px;
-        }
-        .container {
-            width: 90%;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        .dashboard {
-            background-color: #ffffff;
-            padding: 25px;
-            border-radius: 10px;
-            box-shadow: 0 3px 8px rgba(0, 0, 0, 0.05);
-        }
-        .dashboard h2 {
-            color: #1a1a1a;
-            font-size: 1.8em;
-            margin-bottom: 10px;
-        }
-        .dashboard p {
-            font-size: 16px;
-            color: #555555;
-        }
-        .button {
-            display: inline-block;
-            padding: 12px 18px;
-            margin: 8px;
-            color: #ffffff;
-            text-decoration: none;
-            border-radius: 5px;
-            text-align: center;
-            font-weight: bold;
-            font-size: 15px;
-            transition: background-color 0.3s, transform 0.3s;
-            cursor: pointer;
-        }
-        .button.primary { background-color: #00509e; }
-        .button.secondary { background-color: #28a745; }
-        .button.success { background-color: #28a745; }
-        .button.warning { background-color: #fd7e14; }
-        .button.neutral { background-color: #6c757d; }
-        .button.admin { background-color: #6f42c1; }
-        .button:hover {
-            filter: brightness(90%);
-            transform: translateY(-2px);
-        }
-        .button:active {
-            filter: brightness(80%);
-            transform: translateY(0);
-        }
-        .hidden { display: none; }
-        .button-group {
-            margin: 10px 0;
-            padding: 10px;
-            background-color: #e9ecef;
-            border: 1px solid #d6d8db;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-        }
-        @media (max-width: 768px) {
-            .button {
-                display: block;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            .header img {
-                max-width: 80px;
-            }
-            .dashboard h2 {
-                font-size: 1.5em;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <img src="{{ url_for('static', filename='jirani.png') }}" alt="Ochuna Logo">
-        <h1>MASHAMBA NA NYUMBA</h1>    
-        
-        <div class="telephone">Tel: +254 701207062</div>
-    </div>
-    <div class="container">
-        <div class="dashboard">
-            <h2>You are viewing Live! Soko Jirani Portal</h2>
-            <p>Select an option below:</p>
-
-            <button class="button primary" onclick="toggleButtons('random-shop-group')">GO TO MASHAMBA NA NYUMBA</button>
-            <!-- Add this in the dashboard template -->
-            <div class="token-balance" style="background: #e3f2fd; padding: 10px; border-radius: 5px; margin: 10px 0;">
-                <strong>Token Balance: {{ token_balance | default(0.0) }}</strong>
-                <p style="margin: 5px 0 0 0; font-size: 0.9em;">Each search/submission costs 1 token (KES 2)</p>
-            </div>                 
-            <div id="random-shop-group" class="button-group hidden">
-                <a href="{{ url_for('submit_service_provider') }}" class="button success">Post Your Service To Mashamba Na Nyumba</a>
-                <a href="{{ url_for('find_nearest_service_provider') }}" class="button secondary">Search For Any Shamba or Nyumba</a>
-                <a href="{{ url_for('index') }}" class="button neutral">Home</a>
-                <a href="{{ url_for('change_password') }}" class="button warning">Change Password</a>
-            </div>      
-            {% if is_admin %}
-                <div class="button-group">
-                    <a href="{{ url_for('admin_reset_password') }}" class="button admin">Admin Reset Password</a>
-                    <a href="{{ url_for('add_token') }}" class="button admin">Admin Add Token</a>
-                    <a href="{{ url_for('upload_media') }}" class="button admin">Upload Media</a>  <!-- ← ADDED HERE -->
-                    <!-- ADD THIS NEW BUTTON -->
-                    <a href="{{ url_for('admin_vouchers') }}" class="button admin">Manage Vouchers</a>                                                     
-                </div>
-            {% endif %}
-    <script>
-        function toggleButtons(groupId) {
-            var group = document.getElementById(groupId);
-            group.classList.toggle('hidden');
-        }
-    </script>
-</body>
-</html>
-"""
-
-admin_vouchers_html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Voucher Management</title>
-    <style>
-        body { 
-            font-family: Arial, sans-serif; 
-            margin: 20px;
-            background-color: #f4f6f9;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #333;
-            border-bottom: 2px solid #007bff;
-            padding-bottom: 10px;
-        }
-        .stats-container {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin: 20px 0;
-        }
-        .stat-card {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
-            border-left: 4px solid #007bff;
-        }
-        .stat-number {
-            font-size: 24px;
-            font-weight: bold;
-            color: #007bff;
-        }
-        .search-form {
-            background: #e9ecef;
-            padding: 20px;
-            border-radius: 8px;
-            margin: 20px 0;
-        }
-        .form-group {
-            margin-bottom: 15px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-        }
-        input[type="text"], select {
-            width: 100%;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
-        .btn {
-            padding: 10px 15px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            margin-right: 10px;
-        }
-        .btn-primary { background: #007bff; color: white; }
-        .btn-success { background: #28a745; color: white; }
-        .btn-danger { background: #dc3545; color: white; }
-        .btn-warning { background: #ffc107; color: black; }
-        .btn-group {
-            margin: 20px 0;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 20px 0;
-        }
-        th, td {
-            border: 1px solid #ddd;
-            padding: 12px;
-            text-align: left;
-        }
-        th {
-            background-color: #f2f2f2;
-            font-weight: bold;
-        }
-        tr:nth-child(even) {
-            background-color: #f9f9f9;
-        }
-        .status-valid { color: #28a745; font-weight: bold; }
-        .status-expired { color: #dc3545; font-weight: bold; }
-        .status-used { color: #6c757d; font-weight: bold; }
-        .checkbox-group {
-            display: flex;
-            gap: 15px;
-            margin: 10px 0;
-        }
-        .checkbox-group label {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-            font-weight: normal;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>📋 Voucher Management</h1>
-        
-        <!-- Statistics -->
-        <div class="stats-container">
-            <div class="stat-card">
-                <div class="stat-number">{{ stats[0] }}</div>
-                <div>Total Vouchers</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ stats[1] }}</div>
-                <div>Valid Vouchers</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ stats[2] }}</div>
-                <div>Expired Vouchers</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{{ stats[3] }}</div>
-                <div>Used Vouchers</div>
-            </div>
-        </div>
-
-        <!-- Search Form -->
-        <div class="search-form">
-            <form method="GET">
-                <div class="form-group">
-                    <label for="username">Filter by Phone Number:</label>
-                    <input type="text" name="username" value="{{ username_filter }}" 
-                           placeholder="e.g., 0712345678">
-                </div>
-                
-                <div class="checkbox-group">
-                    <label>
-                        <input type="checkbox" name="show_used" value="true" 
-                               {% if show_used %}checked{% endif %}>
-                        Show Used Vouchers
-                    </label>
-                    <label>
-                        <input type="checkbox" name="show_expired" value="true" 
-                               {% if show_expired %}checked{% endif %}>
-                        Show Expired Vouchers
-                    </label>
-                </div>
-                
-                <button type="submit" class="btn btn-primary">Search</button>
-                <a href="{{ url_for('admin_vouchers') }}" class="btn btn-warning">Clear Filters</a>
-            </form>
-        </div>
-
-        <!-- Action Buttons -->
-        <div class="btn-group">
-            <a href="{{ url_for('export_vouchers') }}?username={{ username_filter }}" 
-               class="btn btn-success">📥 Export to CSV</a>
-            <form action="{{ url_for('delete_expired_vouchers') }}" method="POST" style="display: inline;">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <button type="submit" class="btn btn-danger" 
-                        onclick="return confirm('Delete all expired vouchers?')">
-                    🗑️ Delete Expired Vouchers
-                </button>
-            </form>
-            <a href="{{ url_for('dashboard') }}" class="btn btn-primary">← Back to Dashboard</a>
-        </div>
-
-        <!-- Vouchers Table -->
-        <table>
-            <thead>
-                <tr>
-                    <th>Voucher Code</th>
-                    <th>Phone Number</th>
-                    <th>Created At</th>
-                    <th>Created By</th>
-                    <th>Valid Until</th>
-                    <th>Status</th>
-                    <th>Used By</th>
-                    <th>Used At</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for voucher in vouchers %}
-                <tr>
-                    <td><code>{{ voucher[0] }}</code></td>
-                    <td>{{ voucher[1] }}</td>
-                    <td>{{ voucher[2] }}</td>
-                    <td>{{ voucher[3] }}</td>
-                    <td>{{ voucher[4] }}</td>
-                    <td>
-                        {% if voucher[5] %} <!-- Used -->
-                            <span class="status-used">Used</span>
-                        {% elif voucher[4] and voucher[4] < now %}
-                            <span class="status-expired">Expired</span>
-                        {% else %}
-                            <span class="status-valid">Valid</span>
-                        {% endif %}
-                    </td>
-                    <td>{{ voucher[6] if voucher[6] else '-' }}</td>
-                    <td>{{ voucher[5] if voucher[5] else '-' }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-
-        {% if not vouchers %}
-        <div style="text-align: center; padding: 40px; color: #6c757d;">
-            No vouchers found matching your criteria.
-        </div>
-        {% endif %}
-    </div>
-
-    <script>
-        // Auto-format phone number input
-        document.querySelector('input[name="username"]').addEventListener('input', function(e) {
-            let value = e.target.value.replace(/\D/g, '');
-            if (value.startsWith('0')) {
-                value = value.substring(0, 10);
-            }
-            e.target.value = value;
-        });
-
-        // Confirm before deleting expired vouchers
-        document.querySelector('form[action*="delete_expired"]').addEventListener('submit', function(e) {
-            if (!confirm('Are you sure you want to delete all expired vouchers? This action cannot be undone.')) {
-                e.preventDefault();
-            }
-        });
-    </script>
-</body>
-</html>
-"""
-    
-terms_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
-     crossorigin="anonymous"></script>
-    <meta charset="UTF-8">
-    <title>Mashamba na Nyumba - Terms and Conditions</title>
-     
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            margin: 0;
-            padding: 20px;
-            background: linear-gradient(to right, #ffffff, #e0f7fa);
-            color: #333;
-        }
-        h1, h2 {
-            color: #00695c;
-        }
-        section {
-            margin-bottom: 30px;
-        }
-        ul {
-            margin-top: 10px;
-        }
-        footer {
-            margin-top: 50px;
-            font-size: 0.9em;
-            text-align: center;
-            color: #777;
-        }
-    </style>
-</head>
-<body>
-    <h1>Terms and Conditions</h1>    
-    <p><strong>Effective Date:</strong> 1st Jan 2025</p>
-
-    <section>
-        <h2>1. Acceptance of Terms</h2>
-        <p>By accessing or using Mashamba na nyumba, you agree to be bound by these Terms and Conditions. If you do not agree, please do not use our platform.</p>
-    </section>
-
-    <section>
-        <h2>2. Purpose of the Platform</h2>
-        <p>Mashamba na nyumba is a community marketplace that connects service seekers with nearby service providers based on their location and service type.</p>
-    </section>
-
-    <section>
-        <h2>3. User Responsibilities</h2>
-        <ul>
-            <li>Provide accurate and complete information when creating or editing your profile and while updating your service provider details</li>
-            <li>Do not impersonate others or misrepresent your identity or services.</li>
-            <li>Respect other users and refrain from abusive or illegal behavior.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>4. Service Listings</h2>
-        <ul>
-            <li>All service listings must be truthful and lawful.</li>
-            <li>Mashamba na nyumba reserves the right to remove or suspend any listing that violates these terms or appears fraudulent.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>5. Token System</h2>
-        <ul>
-            <li>Access to contact details of service providers and the listing for the service provider details may require tokens.</li>
-            <li>Tokens are virtual access rights and are not redeemable for cash.</li>
-            <li>Any abuse of the token system may lead to account suspension.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>6. Privacy and Data</h2>
-        <p>We collect user data (such as location, phone number, Email and hashed_password) strictly for service matching and user verification. Your data will not be shared with third parties without your consent.</p>
-    </section>
-
-    <section>
-        <h2>7. Account Termination</h2>
-        <p>We reserve the right to suspend or delete user accounts that violate our terms, spread false information, or abuse the platform.</p>
-    </section>
-
-    <section>
-        <h2>8. Limitation of Liability</h2>
-        <p>Mashamba na nyumba acts as a listing and matching platform and is not liable for the conduct or quality of services offered by listed providers. Users engage with each other at their own discretion and risk.</p>
-    </section>
-
-    <section>
-        <h2>9. Intellectual Property</h2>
-        <p>The Mashamba na nyumba name, logo, and system code are protected and may not be copied or reused without written permission.</p>
-    </section>
-
-    <section>
-        <h2>10. Modifications to Terms</h2>
-        <p>We may revise these Terms and Conditions at any time. Users will be notified of any major updates via the platform.</p>
-    </section>
-
-    <section>
-        <h2>11. Contact Us</h2>
-        <p>If you have any questions or concerns about these Terms, contact us at:</p>
-        <ul>
-            <li>Phone/WhatsApp: 0701207062</li>
-            <li>Website: www.pigasimu.co.ke</li>
-        </ul>
-    </section>
-</body>
-</html>
-"""  
- 
-docs_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Mashamba na nyumba - Documentation</title>
-        
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            background-color: #f5fdf7;
-            color: #2e2e2e;
-            line-height: 1.7;
-            padding: 20px;
-        }
-        h1, h2, h3 {
-            color: #388e3c;
-        }
-        code {
-            background: #e0f2f1;
-            padding: 2px 5px;
-            border-radius: 4px;
-        }
-        section {
-            margin-bottom: 40px;
-        }
-        ul {
-            margin-top: 10px;
-        }
-        a {
-            color: #2e7d32;
-            text-decoration: none;
-        }
-        a:hover {
-            text-decoration: underline;
-        }
-        footer {
-            margin-top: 50px;
-            font-size: 0.9em;
-            color: #888;
-            text-align: center;
-        }
-    </style>
-</head>
-<body>
-    <h1>Mashamba na nyumba Platform Documentation</h1>
-
-    <section>
-        <h2>1. Overview</h2>
-        <p>Mashamba na nyumba is a proximity-based service marketplace where users can register as either service providers or clients. The platform enables clients to discover, contact, and engage verified service providers based on location and category.</p>
-    </section>
-
-    <section>
-        <h2>2. User Roles</h2>
-        <ul>
-            <li><strong>Service Provider:</strong> Registers, selects service categories and redeems token units and gets listed in search results.</li>
-            <li><strong>Client:</strong> Searches for nearby providers and redeems tokens to view contact details.</li>
-            <li><strong>Admin:</strong> Manages the platform, users, categories, and token issues.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>3. Token System</h2>
-        <ul>
-            <li>Clients must purchase token units to access provider contact information or submit service contacts.</li>
-            <li>Each contact view or listing deducts one unit of tokens (KES 2).</li>
-            <li>Admin can adjust token values, distribute tokens, or reset balances.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>4. Registration & Login</h2>
-        <ul>
-            <li>Users register via a simple form with username, contact, category, and (hidden location values).</li>
-            <li>All login sessions are secured with session-based cookies and rate limiting.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>5. Searching & Filtering</h2>
-        <ul>
-            <li>Clients can filter service providers based on distance, category, and location.</li>
-            <li>Search results are sorted by category, proximity and distance.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>6. Admin Panel</h2>
-        <p>Accessible at <code>/admin/login</code>. Key functions:</p>
-        <ul>
-            <li>Login with secure admin credentials.</li>
-            <li>View, search, and manage registered users.</li>
-            <li>Set and reset token balances.</li>
-            <li>Manage allowed categories, regions, and user bans.</li>
-            <li>Monitor access logs, errors, and platform usage.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>7. API Endpoints</h2>
-        <p>These routes are secured and accessed via browser or client app:</p>
-        <ul>
-            <li><code>/</code> - Homepage / Landing page</li>
-            <li><code>/register</code> - User registration form</li>
-            <li><code>/login</code> - Login form</li>
-            <li><code>/logout</code> - Session reset and logout</li>
-            <li><code>/search</code> - Dynamic filter form for clients</li>
-            <li><code>/redeem</code> - Token redemption and contact reveal</li>
-            <li><code>/admin/login</code> - Admin portal access</li>
-            <li><code>/privacy</code> - Privacy policy page</li>
-            <li><code>/terms</code> - Terms and Conditions</li>
-            <li><code>/docs</code> - This documentation</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>8. Security Features</h2>
-        <ul>
-            <li>CSRF protection on all forms.</li>
-            <li>Rate limiting on login and sensitive routes.</li>
-            <li>Session clearing when switching between roles.</li>
-            <li>Audit logging for key admin actions.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>9. Deployment & Hosting</h2>
-        <ul>
-            <li>Designed for deployment on Render, Railway, or Fly.io.</li>
-            <li>Uses PostgreSQL with schema separation.</li>
-            <li>Sessions and cookies configured for secure environments.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>10. Support</h2>
-        <p>If you have questions, issues, or wish to report a bug, contact our support:</p>
-        <ul>
-            <li>WhatsApp: 0701207062</li>
-        </ul>
-    </section>
-</body>
-</html>
-"""
-
-privacy_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Mashamba na nyumba - Privacy Policy</title>    
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            margin: 0;
-            padding: 20px;
-            background: linear-gradient(to right, #ffffff, #f1f8e9);
-            color: #333;
-        }
-        h1, h2 {
-            color: #558b2f;
-        }
-        section {
-            margin-bottom: 30px;
-        }
-        ul {
-            margin-top: 10px;
-        }
-        footer {
-            margin-top: 50px;
-            font-size: 0.9em;
-            text-align: center;
-            color: #777;
-        }
-    </style>
-</head>
-<body>
-    <h1>Privacy Policy</h1>
-
-    <p><strong>Effective Date:</strong> 1st Jan 2025</p>
-
-    <section>
-        <h2>1. Introduction</h2>
-        <p>At Mashamba na nyumba, we value your privacy. This policy outlines how we collect, use, and protect your personal information while using our platform.</p>
-    </section>
-
-    <section>
-        <h2>2. Information We Collect</h2>
-        <ul>
-            <li><strong>Personal Data:</strong> phone number, email, hashed_password, location, and service categories.</li>
-            <li><strong>Device and Usage Data:</strong> IP address, browser type, device information, and pages visited.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>3. How We Use Your Information</h2>
-        <ul>
-            <li>To match service seekers with nearby service providers.</li>
-            <li>To manage user profiles and update contact information.</li>
-            <li>To improve our services and user experience.</li>
-            <li>To send important account or service-related communications.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>4. Sharing of Information</h2>
-        <p>We do not sell or rent your personal information. Your information is only shared:</p>
-        <ul>
-            <li>With other users, when they redeem tokens to view your contact.</li>
-            <li>With trusted service providers strictly for operating our platform (e.g., SMS or email delivery).</li>
-            <li>When required by law or to protect our legal rights.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>5. Data Security</h2>
-        <p>We implement strong security measures to protect your data from unauthorized access, loss, or alteration. However, no method of data transmission is 100% secure.</p>
-    </section>
-
-    <section>
-        <h2>6. Your Rights</h2>
-        <ul>
-            <li>You can request to access, correct, or delete your personal data.</li>
-            <li>You may deactivate your account at any time by contacting our support team.</li>
-            <li>You can opt out of promotional messages by following the unsubscribe link or contacting us directly.</li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>7. Children's Privacy</h2>
-        <p>Mashamba na nyumba does not knowingly collect personal data from users under the age of 18. If we become aware of such data, we will delete it promptly.</p>
-    </section>
-
-    <section>
-        <h2>8. Updates to This Policy</h2>
-        <p>We may update this Privacy Policy to reflect changes to our practices. When we do, we will notify users via the platform or email.</p>
-    </section>
-
-    <section id="business-data-policy">
-        <h2>Collection of Publicly Available Business Information</h2>
-        <p>
-            As part of our Mashamba na nyumba business directory strategy, we may collect and display 
-            publicly available business contact information, such as <strong>business names, telephone numbers, 
-            and service descriptions</strong>, that are openly displayed on signboards, banners, shops, 
-            or roadside advertisements.
-        </p>
-
-        <h3>Purpose</h3>
-        <p>
-            This data is collected to improve the accessibility and reach of local businesses 
-            to users of the Mashamba na nyumba app and website. It supplements — not replaces — the 
-            already available methods of user-submitted listings.
-        </p>
-
-        <h3>Lawful Basis</h3>
-        <p>
-            This activity is carried out under the principles of <strong>legitimate interest</strong> and 
-            <strong>public interest</strong> as defined under the <em>Kenya Data Protection Act, 2019</em>. 
-            Only business-related information that is <strong>already public</strong> is collected.
-        </p>
-
-        <h3>Use Limitations</h3>
-        <ul>
-            <li>We do <strong>not</strong> use this data for unsolicited marketing or spam.</li>
-            <li>We do <strong>not</strong> sell or share this data with third parties.</li>
-            <li>We do <strong>not</strong> collect private or confidential information without explicit consent.</li>
-        </ul>
-
-        <h3>Corrections and Removal Requests</h3>
-        <p>
-            Business owners have the right to request corrections or removal of their information 
-            from our directory. To do so, kindly contact us at:
-            <br />
-            📧 <a href="mailto:jamesochuna37@gnail.com">jamesochuna37@gnail.com</a><br />
-            📞 <a href="tel:+254701207062">0701 207 062</a>
-        </p>
-
-        <h3>Your Rights</h3>
-        <p>
-            All users have the right to access, correct, or request deletion of personal or business 
-            data listed on our platform. We will process such requests within 7 working days.
-        </p>
-    </section>    
-
-    <section>
-        <h2>9. Contact Us</h2>
-        <p>If you have any questions or concerns about this Privacy Policy, please contact:</p>
-        <ul>
-            <li>Phone/WhatsApp: 0701207062</li>
-            <li>Website: <a href="https://pigasimu.co.ke">https://pigasimu.co.ke</a></li>
-        </ul>
-    </section>
-</body>
-</html>
-"""   
-
-
-
-login_html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Soko Jirani Portals - Login</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(to bottom right, #388e3c, #4caf50);
-            color: #fff;
             margin: 0;
             padding: 0;
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 100vh;
+            min-height: 100vh;
+            background: linear-gradient(to right, #43cea2, #185a9d);
+            color: white;
         }
-                
         .container {
-            background: linear-gradient(145deg, #f0f4ff, #dce7f7);
-            padding: 30px 25px;
-            border-radius: 12px;
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
-            max-width: 350px;
             width: 90%;
-            text-align: center;
-            color: #333;
-        }
-
-        h1 {
-            margin-bottom: 20px;
-            font-size: 28px;
-            color: #1a237e;
-            font-weight: 600;
-        }        
-
-        label {
-            display: block;
-            margin: 15px 0 5px;
-            text-align: left;
-        }
-
-        input[type="text"], input[type="password"] {
-            width: 100%;
-            padding: 10px;
-            border-radius: 6px;
-            border: none;
-            margin-bottom: 15px;
-        }
-
-        input[type="submit"] {
-            background-color: #1976d2;
-            color: white;
-            padding: 10px;
-            border: none;
-            border-radius: 6px;
-            width: 100%;
-            cursor: pointer;
-            font-weight: bold;
-            font-size: 16px;
-        }
-
-        input[type="submit"]:hover {
-            background-color: #125aaa;
-        }
-
-        .link-button {
-            display: block;
-            margin: 15px 0;
-            text-decoration: none;
-            color: white;
-            background-color: #1976d2;
-            padding: 10px;
-            border-radius: 6px;
-            font-weight: bold;
-        }
-
-        .link-button:hover {
-            background-color: #125aaa;
-        }
-
-        ul {
-            list-style-type: none;
-            padding: 0;
-            margin-top: 15px;
-        }
-
-        li {
-            margin-bottom: 8px;
-            color: #ffeb3b;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Login</h1>
-        <form method="post">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <label for="username">Phone Number:</label>
-            <input type="text" name="username" required>
-            <label for="password">Password:</label>
-            <input type="password" name="password" required>
-            <input type="submit" value="Login">
-        </form>
-        <a href="{{ url_for('index') }}" class="link-button">Back to Home</a>
-
-        {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-        <ul>
-            {% for category, message in messages %}
-            <li class="{{ category }}">{{ message }}</li>
-            {% endfor %}
-        </ul>
-        {% endif %}
-        {% endwith %}
-    </div>
-</body>
-</html>
-"""
-
-unlock_account_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Unlock Account</title>      
-    
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f4f6f7;
-            color: #333333;
-            text-align: center;
-            margin: 0;
-            padding: 0;
-        }
-        h1 {
-            background-color: #4caf50;
-            color: white;
-            padding: 20px;
-            margin-bottom: 40px;
-            border-bottom: 5px solid #388e3c;
-        }
-        .form-container {
-            background-color: #ffffff;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-            display: inline-block;
-            width: 100%;
-            max-width: 400px;
-        }
-        label {
-            font-size: 1.2em;
-            color: #333333;
-            margin-bottom: 10px;
-            display: block;
-            text-align: left;
-        }
-        input[type="text"] {
-            padding: 10px;
-            margin-bottom: 20px;
-            border-radius: 5px;
-            border: 1px solid #cccccc;
-            width: calc(100% - 22px);
-            font-size: 1em;
-        }
-        input[type="submit"] {
-            background-color: #1976d2;
-            color: white;
-            padding: 12px;
-            font-size: 1.2em;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            width: 100%;
-        }
-        input[type="submit"]:hover {
-            background-color: #1565c0;
-        }
-        .flash-message {
-            background-color: #ffcccc;
-            color: #cc0000;
-            padding: 10px;
-            margin-bottom: 20px;
-            border: 1px solid #ff9999;
-            border-radius: 5px;
-        }
-        .flash-success {
-            background-color: #ccffcc;
-            color: #006600;
-            padding: 10px;
-            margin-bottom: 20px;
-            border: 1px solid #99ff99;
-            border-radius: 5px;
-        }
-    </style>
-</head>
-<body>
-    <h1>Unlock Your Account</h1>       
-    {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-            {% for category, message in messages %}
-                <div class="flash-message {{ 'flash-' + category }}">{{ message }}</div>
-            {% endfor %}
-        {% endif %}
-    {% endwith %}
-    <div class="form-container">
-        <form method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <label for="username">Enter Your Username:</label>
-            <input type="text" name="username" required><br>
-            <label for="token">Enter Purchased Token:</label>
-            <input type="text" name="token" required><br>
-            <input type="submit" value="Submit Token">
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-admin_reset_password_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Password Reset</title>
-    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-</head>
-<body>
-    <div class="container mt-5">
-        <h2 class="mb-4">Admin Password Reset</h2>
-        <form method="POST">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">        
-            <!-- Changed label -->
-            <div class="form-group">
-                <label for="username">Phone Number (or Username):</label>
-                <input type="text" name="username" id="username" class="form-control" required>
-            </div>
-            <div class="form-group">
-                <label for="new_password">New Password:</label>
-                <input type="password" name="new_password" id="new_password" class="form-control" required>
-            </div>
-            <button type="submit" class="btn btn-primary">Reset Password</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-change_password_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Change Password Page">       
-    
-    <title>Change Password</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: #f4f4f4;
-        }
-        .container {
-            width: 100%;
-            max-width: 500px;
-            margin: 50px auto;
-            padding: 20px;
-            background-color: #ffffff;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        }
-        h1 {
-            text-align: center;
-            color: #333333;
-        }
-        form {
-            margin-top: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 10px;
-            font-weight: bold;
-        }
-        input[type="password"], input[type="submit"] {
-            width: 100%;
-            padding: 12px;
-            margin-bottom: 20px;
-            border-radius: 5px;
-            border: 1px solid #ccc;
-            font-size: 16px;
-        }
-        input[type="submit"] {
-            background-color: #28a745;
-            color: white;
-            cursor: pointer;
-            font-weight: bold;
-        }
-        input[type="submit"]:hover {
-            background-color: #218838;
-        }
-        .message {
-            text-align: center;
-            margin-top: 20px;
-        }
-        .alert {
-            padding: 15px;
-            background-color: #f44336;
-            color: white;
-            border-radius: 5px;
-            text-align: center;
-            margin-bottom: 15px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Change Password</h1>                        
-        <!-- Flash message for feedback -->            
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-
-        <form action="{{ url_for('change_password') }}" method="POST">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <label for="current_password">Current Password</label>
-            <input type="password" name="current_password" id="current_password" required placeholder="Enter current password">
-
-            <label for="new_password">New Password</label>
-            <input type="password" name="new_password" id="new_password" required placeholder="Enter new password">
-
-            <label for="confirm_password">Confirm New Password</label>
-            <input type="password" name="confirm_password" id="confirm_password" required placeholder="Confirm new password">
-
-            <input type="submit" value="Change Password">
-        </form>
-        
-        <div class="back-button">
-            <a href="{{ url_for('dashboard') }}">Back to Dashboard</a>
-        </div>
-    </div>        
-
-        <div class="message">
-            <p>Ensure your new password is at least 8 characters long.</p>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-add_token_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Add Tokens - Admin</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: #f4f6f9;
-            color: #343a40;
-        }
-        .container {
-            width: 80%;
-            max-width: 600px;
-            margin: 30px auto;
-            padding: 20px;
-            background-color: #ffffff;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-            border-radius: 10px;
-        }
-        h1 {
-            text-align: center;
-            font-size: 2.5em;
-            margin-bottom: 20px;
-            color: #007bff;
-        }
-        .info-box {
-            background: #e7f3ff;
-            border: 1px solid #b3d9ff;
-            border-radius: 5px;
-            padding: 15px;
-            margin-bottom: 20px;
-        }
-        form {
-            background-color: #fff;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-        }
-        label {
-            font-size: 1.1em;
-            margin-bottom: 5px;
-            display: block;
-            color: #343a40;
-            font-weight: bold;
-        }
-        input[type="text"],
-        input[type="number"],
-        select {
-            width: 100%;
-            padding: 10px;
-            margin-bottom: 20px;
-            border: 1px solid #ced4da;
-            border-radius: 5px;
-            font-size: 1em;
-            box-sizing: border-box;
-        }
-        input[type="submit"] {
-            background-color: #007bff;
-            color: white;
-            border: none;
-            padding: 12px;
-            cursor: pointer;
-            font-size: 1.1em;
-            width: 100%;
-            border-radius: 5px;
-        }
-        input[type="submit"]:hover {
-            background-color: #0056b3;
-        }
-        .token-info {
-            background: #d4edda;
-            border: 1px solid #c3e6cb;
-            border-radius: 5px;
-            padding: 10px;
-            margin: 10px 0;
-        }
-        .flashes {
-            margin-bottom: 20px;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        .flashes .success {
-            background-color: #d4edda;
-            color: #155724;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        .flashes .danger {
-            background-color: #f8d7da;
-            color: #721c24;
-            padding: 10px;
-            border-radius: 5px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Manual Token Addition</h1>
-
-        <div class="info-box">
-            <strong>M-Pesa Alternative System</strong>
-            <p>Use this when M-Pesa is down. Tokens work exactly like M-Pesa purchases.</p>
-            <div class="token-info">
-                <strong>Pricing:</strong> KES 2 = 1 token<br>
-                <strong>Service Cost:</strong> 1 token per search/submission<br>
-                <strong>Validity:</strong> 30 days
-            </div>
-        </div>
-
-        <!-- Display Flash Messages -->
-        {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-        <div class="flashes">
-            {% for category, message in messages %}
-            <div class="{{ category }}">{{ message }}</div>
-            {% endfor %}
-        </div>
-        {% endif %}
-        {% endwith %}
-
-        <form action="{{ url_for('add_token') }}" method="POST">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            
-            <label for="username">User Phone Number:</label>
-            <input type="text" id="username" name="username" placeholder="e.g., 0712345678" required>
-            
-            <label for="amount">Payment Amount (KES):</label>
-            <input type="number" id="amount" name="amount" min="2" step="2" placeholder="e.g., 20 for 10 tokens" required>
-            
-            <label for="payment_method">Payment Method:</label>
-            <select id="payment_method" name="payment_method" required>
-                <option value="">Select payment method</option>
-                <option value="cash">Cash</option>
-                <option value="bank_transfer">Bank Transfer</option>
-                <option value="other">Other</option>
-            </select>
-            
-            <input type="submit" value="Add Tokens">
-        </form>
-        
-        <div style="margin-top: 20px; text-align: center;">
-            <a href="{{ url_for('dashboard') }}">Back to Dashboard</a>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-submit_service_provider_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Submit Service Provider Information">
-    <title>Submit Service Provider</title>      
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-            margin: 0;
-            padding: 0;
-        }
-        .container {
-            max-width: 500px;
-            margin: 50px auto;
-            padding: 20px;
-            background-color: #ffffff;
-            border-radius: 10px;
-            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
-        }
-        h1 {
-            text-align: center;
-            color: #333333;
-        }
-        form {
-            margin-top: 20px;
-        }
-        label {
-            font-weight: bold;
-            display: block;
-            margin-bottom: 10px;
-        }
-        select, input[type="tel"], input[type="password"], input[type="submit"], button {
-            width: 100%;
-            padding: 12px;
-            margin-bottom: 20px;
-            border-radius: 5px;
-            border: 1px solid #ccc;
-            font-size: 16px;
-        }
-        input[type="submit"], button {
-            background-color: #007bff;
-            color: white;
-            cursor: pointer;
-            font-weight: bold;
-        }
-        input[type="submit"]:hover, button:hover {
-            background-color: #0056b3;
-        }
-        button:disabled {
-            background-color: #6c757d;
-            cursor: not-allowed;
-        }
-        .alert {
-            padding: 15px;
-            background-color: #f44336;
-            color: white;
-            border-radius: 5px;
-            text-align: center;
-            margin-bottom: 15px;
-        }
-        .success {
-            background-color: #28a745;
-        }
-        .warning {
-            background-color: #ffc107;
-            color: #000;
-        }
-        .location-status {
-            padding: 10px;
-            border-radius: 5px;
-            margin-bottom: 15px;
-            text-align: center;
-            font-weight: bold;
-        }
-        .location-active {
-            background-color: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        .location-inactive {
-            background-color: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffeaa7;
-        }
-        .location-error {
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        .back-to-dashboard {
-            display: block;
-            text-align: center;
-            margin-top: 20px;
-            font-size: 16px;
-        }
-        .back-to-dashboard a {
-            text-decoration: none;
-            color: #007bff;
-        }
-        .back-to-dashboard a:hover {
-            color: #0056b3;
-        }
-        .coordinates-display {
-            background-color: #f8f9fa;
-            padding: 10px;
-            border-radius: 5px;
-            margin-bottom: 15px;
-            font-family: monospace;
-            text-align: center;
-        }
-        .user-info {
-            background-color: #e7f3ff;
-            padding: 10px;
-            border-radius: 5px;
-            margin-bottom: 15px;
-            text-align: center;
-            border-left: 4px solid #007bff;
-        }
-        .auto-fill-notice {
-            background-color: #d1ecf1;
-            padding: 10px;
-            border-radius: 5px;
-            margin-bottom: 15px;
-            text-align: center;
-            border-left: 4px solid #17a2b8;
-        }
-        .registration-success {
-            background-color: #e8f5e8;
-            border: 2px solid #4caf50;
-            border-radius: 10px;
-            padding: 20px;
-            margin: 20px 0;
-            text-align: center;
-        }
-        .location-details {
-            background-color: #fff3cd;
-            border: 1px solid #ffc107;
-            border-radius: 5px;
-            padding: 15px;
-            margin: 10px 0;
-        }
-        .token-info {
-            background-color: #e7f3ff;
-            border: 1px solid #007bff;
-            border-radius: 5px;
-            padding: 10px;
-            margin: 10px 0;
-            text-align: center;
-        }
-        .service-area-info {
-            background-color: #f0f8ff;
-            border: 1px solid #4682b4;
-            border-radius: 5px;
-            padding: 15px;
-            margin: 15px 0;
-        }
-        .coordinates-preview {
-            font-family: monospace;
-            background-color: #f8f9fa;
-            padding: 8px;
-            border-radius: 4px;
-            margin: 5px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Submit Service Provider Information</h1>        
-        <!-- Mashamba na Nyumba -->              
-        <!-- Flash messages for feedback -->
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-
-        <!-- User Info Display -->
-        <div id="userInfo" class="user-info" style="display: none;">
-            Welcome back! <span id="userName">User</span>
-        </div>
-
-        <!-- Auto-fill Notice -->
-        <div id="autoFillNotice" class="auto-fill-notice" style="display: none;">
-            Your information has been auto-filled
-        </div>
-
-        <!-- Registration Success Display -->
-        <div id="registrationSuccess" class="registration-success" style="display: none;">
-            <h3>✅ Registration Successful!</h3>
-            <div class="location-details">
-                <strong>Service Type:</strong> <span id="successServiceType">-</span><br>
-                <strong>Phone Number:</strong> <span id="successPhoneNumber">-</span><br>
-                <strong>Location Registered:</strong> <span id="successLocation">Your current location</span>
-            </div>
-            <div class="service-area-info">
-                <h4>📍 Service Area Registered</h4>
-                <p>Your service will be available to clients within your area.</p>
-                <div class="coordinates-preview">
-                    Location accuracy: <span id="locationAccuracy">-</span> meters
-                </div>
-            </div>
-            <div class="token-info">
-                <strong>2 tokens deducted from your account</strong><br>
-                <small>Your service is now visible to nearby clients</small>
-            </div>
-        </div>
-
-        <!-- Location Status Display -->
-        <div id="locationStatus" class="location-status location-inactive">
-            📍 Location: Waiting for permission...
-        </div>
-
-        <!-- Coordinates Display - HIDDEN AS REQUESTED -->
-        <div id="coordinatesDisplay" class="coordinates-display" style="display: none;">
-            Location verified successfully
-        </div>
-
-        <!-- Location Accuracy Info -->
-        <div id="locationAccuracyInfo" class="service-area-info" style="display: none;">
-            <h4>📍 Your Service Coverage Area</h4>
-            <p>Based on your current location accuracy of <span id="accuracyValue">-</span> meters, 
-               clients within this range will be able to find your service.</p>
-            <p><strong>Better location accuracy = Better client matching</strong></p>
-        </div>
-
-        <form action="{{ url_for('submit_service_provider') }}" method="POST" id="submitServiceProviderForm">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">        
-            
-            <label for="service_type">Select Service Type</label>
-            <select name="service_type" id="service_type" required>
-                <option value="" disabled selected>Select a service</option>
-                <option value="Shamba">Shamba</option>
-                <option value="Nyumba">Nyumba</option>     
-            </select>           
-
-            <label for="phone_number">Phone Number</label>
-            <input type="tel" name="phone_number" id="phone_number" pattern="\\d{10}" inputmode="tel" required placeholder="Enter your 10-digit phone number">
-
-            <label for="password">Password</label>
-            <input type="password" name="password" id="password" minlength="8" required placeholder="Enter your password">
-
-            <!-- Automatically filled longitude and latitude -->
-            <input type="hidden" name="longitude" id="longitude">
-            <input type="hidden" name="latitude" id="latitude">
-
-            <!-- Auto-filled user credentials -->
-            <input type="hidden" name="user_id" id="user_id">
-            <input type="hidden" name="auto_auth" id="auto_auth" value="true">
-
-            <!-- Location Accuracy -->
-            <input type="hidden" name="location_accuracy" id="location_accuracy">
-
-            <!-- Enable Location Button -->
-            <button type="button" id="enableLocationBtn">📍 Enable Location Services</button>
-
-            <input type="submit" id="submitBtn" value="Register as Service Provider" disabled>
-
-            <div class="token-info">
-                <strong>Cost: 2 tokens</strong><br>
-                <small>Tokens will be deducted upon successful registration</small>
-            </div>
-        </form>
-
-        <div class="message">
-            <p><strong>Location is required:</strong> We need your current location to register you as a service provider in the correct area.</p>
-            <p><strong>Service Area:</strong> Clients will find you based on your registered location and service type.</p>
-        </div>
-
-        <!-- Back to Dashboard link -->
-        <div class="back-to-dashboard">
-            <a href="{{ url_for('dashboard') }}">Back to Dashboard</a>
-        </div>
-    </div>
-
-    <script>
-        let hasLocation = false;
-        let currentCoordinates = null;
-        let isUserLoggedIn = false;
-        let userData = null;
-
-        document.addEventListener('DOMContentLoaded', function() {
-            const locationStatus = document.getElementById('locationStatus');
-            const coordinatesDisplay = document.getElementById('coordinatesDisplay');
-            const enableLocationBtn = document.getElementById('enableLocationBtn');
-            const submitBtn = document.getElementById('submitBtn');
-            const longitudeInput = document.getElementById('longitude');
-            const latitudeInput = document.getElementById('latitude');
-            const userInfo = document.getElementById('userInfo');
-            const userName = document.getElementById('userName');
-            const autoFillNotice = document.getElementById('autoFillNotice');
-            const userIdInput = document.getElementById('user_id');
-            const phoneInput = document.getElementById('phone_number');
-            const passwordInput = document.getElementById('password');
-            const locationAccuracyInput = document.getElementById('location_accuracy');
-            const locationAccuracyInfo = document.getElementById('locationAccuracyInfo');
-            const accuracyValue = document.getElementById('accuracyValue');
-            const registrationSuccess = document.getElementById('registrationSuccess');
-            const successServiceType = document.getElementById('successServiceType');
-            const successPhoneNumber = document.getElementById('successPhoneNumber');
-            const locationAccuracyDisplay = document.getElementById('locationAccuracy');
-
-            // Check user authentication and auto-fill credentials
-            checkUserAuthentication();
-
-            // Process any successful registration messages
-            processSuccessMessages();
-
-            // Check if geolocation is supported
-            if (!navigator.geolocation) {
-                locationStatus.textContent = '📍 Location: Not supported by your browser';
-                locationStatus.className = 'location-status location-error';
-                enableLocationBtn.disabled = true;
-                enableLocationBtn.textContent = 'Location Not Supported';
-                return;
-            }
-
-            // Enable Location Button Click Handler
-            enableLocationBtn.addEventListener('click', function() {
-                requestLocationAccess();
-            });
-
-            function checkUserAuthentication() {
-                // Check for existing session or stored credentials
-                const userSession = localStorage.getItem('user_session');
-                const authToken = localStorage.getItem('auth_token');
-                const userCredentials = localStorage.getItem('user_credentials');
-                
-                if (userSession || authToken) {
-                    try {
-                        userData = userSession ? JSON.parse(userSession) : null;
-                        isUserLoggedIn = true;
-                        
-                        // Update UI for logged-in user
-                        userInfo.style.display = 'block';
-                        if (userData && userData.name) {
-                            userName.textContent = userData.name;
-                        }
-                        
-                        // Auto-fill user ID if available
-                        if (userData && userData.id) {
-                            userIdInput.value = userData.id;
-                        }
-                        
-                        console.log('User auto-authenticated');
-                    } catch (e) {
-                        console.log('No valid user session found');
-                    }
-                }
-                
-                // Auto-fill credentials if available
-                if (userCredentials) {
-                    try {
-                        const credentials = JSON.parse(userCredentials);
-                        if (credentials.phone) {
-                            phoneInput.value = credentials.phone;
-                        }
-                        // Note: Passwords should not be stored in localStorage for security reasons
-                        // In a real implementation, use secure tokens instead
-                        
-                        autoFillNotice.style.display = 'block';
-                    } catch (e) {
-                        console.log('No stored credentials found');
-                    }
-                }
-                
-                // Additional check for server-side session
-                fetch('/check-auth', {
-                    method: 'GET',
-                    credentials: 'same-origin'
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.authenticated && data.user) {
-                        isUserLoggedIn = true;
-                        userData = data.user;
-                        userInfo.style.display = 'block';
-                        userName.textContent = userData.name || 'User';
-                        if (userData.id) {
-                            userIdInput.value = userData.id;
-                        }
-                        if (userData.phone) {
-                            phoneInput.value = userData.phone;
-                            autoFillNotice.style.display = 'block';
-                        }
-                    }
-                })
-                .catch(error => {
-                    console.log('Auth check failed, proceeding without auto-login');
-                });
-            }
-
-            function processSuccessMessages() {
-                const flashMessages = document.querySelectorAll('.alert');
-                flashMessages.forEach(message => {
-                    const messageText = message.textContent;
-                    
-                    // Check if this is a successful registration message
-                    if (message.classList.contains('success') && 
-                        (messageText.includes('successfully') || messageText.includes('registered') || messageText.includes('updated'))) {
-                        
-                        // Extract information from the form
-                        const serviceType = document.getElementById('service_type').value;
-                        const phoneNumber = document.getElementById('phone_number').value;
-                        
-                        // Display success section
-                        successServiceType.textContent = serviceType || 'Service';
-                        successPhoneNumber.textContent = phoneNumber || 'Your number';
-                        
-                        // Show the success section
-                        registrationSuccess.style.display = 'block';
-                        
-                        // Hide the form
-                        document.getElementById('submitServiceProviderForm').style.display = 'none';
-                        
-                        // Scroll to success message
-                        registrationSuccess.scrollIntoView({ behavior: 'smooth' });
-                        
-                        // Hide the original flash message after processing
-                        setTimeout(() => {
-                            message.style.display = 'none';
-                        }, 1000);
-                    }
-                });
-            }
-
-            function requestLocationAccess() {
-                locationStatus.textContent = '📍 Location: Requesting permission...';
-                locationStatus.className = 'location-status location-inactive';
-                enableLocationBtn.disabled = true;
-                enableLocationBtn.textContent = '🔄 Detecting Location...';
-                
-                // Request high accuracy location
-                navigator.geolocation.getCurrentPosition(
-                    // Success callback
-                    function(position) {
-                        const lat = position.coords.latitude;
-                        const lng = position.coords.longitude;
-                        const accuracy = position.coords.accuracy;
-                        
-                        // Store coordinates and accuracy
-                        longitudeInput.value = lng;
-                        latitudeInput.value = lat;
-                        locationAccuracyInput.value = accuracy;
-                        currentCoordinates = { lat, lng, accuracy };
-                        
-                        // Update UI
-                        const accuracyLevel = accuracy < 50 ? 'High' : accuracy < 200 ? 'Medium' : 'Low';
-                        locationStatus.textContent = `📍 Location: Active (${accuracyLevel} accuracy)`;
-                        locationStatus.className = 'location-status location-active';
-                        
-                        // Update accuracy display
-                        accuracyValue.textContent = Math.round(accuracy);
-                        locationAccuracyDisplay.textContent = Math.round(accuracy) + ' meters';
-                        
-                        // Show location info and coordinates display
-                        coordinatesDisplay.style.display = 'block';
-                        locationAccuracyInfo.style.display = 'block';
-                        
-                        enableLocationBtn.textContent = '🔄 Update Location';
-                        enableLocationBtn.disabled = false;
-                        submitBtn.disabled = false;
-                        hasLocation = true;
-                        
-                        // Start watching position for updates
-                        startWatchingPosition();
-                    },
-                    // Error callback
-                    function(error) {
-                        handleLocationError(error);
-                    },
-                    // Options - high accuracy for better service matching
-                    {
-                        enableHighAccuracy: true,
-                        timeout: 15000,
-                        maximumAge: 60000
-                    }
-                );
-            }
-
-            function startWatchingPosition() {
-                if ('geolocation' in navigator) {
-                    navigator.geolocation.watchPosition(
-                        function(position) {
-                            const lat = position.coords.latitude;
-                            const lng = position.coords.longitude;
-                            const accuracy = position.coords.accuracy;
-                            
-                            // Update coordinates if they changed significantly or accuracy improved
-                            if (currentCoordinates && 
-                                (Math.abs(currentCoordinates.lat - lat) > 0.0001 || 
-                                 Math.abs(currentCoordinates.lng - lng) > 0.0001 ||
-                                 Math.abs(currentCoordinates.accuracy - accuracy) > 10)) {
-                                
-                                longitudeInput.value = lng;
-                                latitudeInput.value = lat;
-                                locationAccuracyInput.value = accuracy;
-                                currentCoordinates = { lat, lng, accuracy };
-                                
-                                // Update accuracy display
-                                accuracyValue.textContent = Math.round(accuracy);
-                                locationAccuracyDisplay.textContent = Math.round(accuracy) + ' meters';
-                                
-                                const accuracyLevel = accuracy < 50 ? 'High' : accuracy < 200 ? 'Medium' : 'Low';
-                                locationStatus.textContent = `📍 Location: Active (${accuracyLevel} accuracy)`;
-                            }
-                        },
-                        function(error) {
-                            console.log('Location watch error:', error);
-                        },
-                        {
-                            enableHighAccuracy: true,
-                            maximumAge: 30000
-                        }
-                    );
-                }
-            }
-
-            function handleLocationError(error) {
-                let errorMessage = '📍 Location: ';
-                let userMessage = '';
-                
-                switch(error.code) {
-                    case error.PERMISSION_DENIED:
-                        errorMessage += 'Permission denied.';
-                        userMessage = 'Please allow location access in your browser settings to register as a service provider.';
-                        break;
-                    case error.POSITION_UNAVAILABLE:
-                        errorMessage += 'Location information unavailable.';
-                        userMessage = 'Please check your device location settings and try again.';
-                        break;
-                    case error.TIMEOUT:
-                        errorMessage += 'Location request timed out.';
-                        userMessage = 'Location detection took too long. Please try again.';
-                        break;
-                    default:
-                        errorMessage += 'An unknown error occurred.';
-                        userMessage = 'Please try enabling location again.';
-                        break;
-                }
-                
-                locationStatus.textContent = errorMessage;
-                locationStatus.className = 'location-status location-error';
-                enableLocationBtn.textContent = '📍 Retry Location Access';
-                enableLocationBtn.disabled = false;
-                submitBtn.disabled = true;
-                hasLocation = false;
-                
-                if (userMessage) {
-                    alert(userMessage);
-                }
-            }
-
-            // Prevent form submission if location is not available
-            document.getElementById('submitServiceProviderForm').addEventListener('submit', function(event) {
-                if (!hasLocation || !longitudeInput.value || !latitudeInput.value) {
-                    event.preventDefault();
-                    alert('Please enable location services before submitting.');
-                    enableLocationBtn.scrollIntoView({ behavior: 'smooth' });
-                } else {
-                    // Show loading state
-                    submitBtn.disabled = true;
-                    submitBtn.value = 'Registering... Please wait';
-                }
-            });
-
-            // Try to get location automatically on page load (with user permission)
-            setTimeout(() => {
-                if (!hasLocation) {
-                    navigator.geolocation.getCurrentPosition(
-                        function(position) {
-                            // If we get location automatically, update UI
-                            const lat = position.coords.latitude;
-                            const lng = position.coords.longitude;
-                            const accuracy = position.coords.accuracy;
-                            
-                            longitudeInput.value = lng;
-                            latitudeInput.value = lat;
-                            locationAccuracyInput.value = accuracy;
-                            currentCoordinates = { lat, lng, accuracy };
-                            
-                            const accuracyLevel = accuracy < 50 ? 'High' : accuracy < 200 ? 'Medium' : 'Low';
-                            locationStatus.textContent = `📍 Location: Auto-detected (${accuracyLevel} accuracy)`;
-                            locationStatus.className = 'location-status location-active';
-                            
-                            // Update accuracy display
-                            accuracyValue.textContent = Math.round(accuracy);
-                            locationAccuracyDisplay.textContent = Math.round(accuracy) + ' meters';
-                            
-                            coordinatesDisplay.style.display = 'block';
-                            locationAccuracyInfo.style.display = 'block';
-                            
-                            enableLocationBtn.textContent = '🔄 Update Location';
-                            submitBtn.disabled = false;
-                            hasLocation = true;
-                        },
-                        function(error) {
-                            // Silent fail - user will manually enable
-                            console.log('Auto-location failed, waiting for manual activation');
-                        },
-                        {
-                            enableHighAccuracy: false,
-                            timeout: 8000,
-                            maximumAge: 300000
-                        }
-                    );
-                }
-            }, 1000);
-        });
-    </script>
-</body>
-</html>
-"""
-
-find_nearest_service_provider_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Find Nearest Service Provider">
-    <title>Find Nearest Service Provider</title>          
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-            margin: 0;
-            padding: 0;
-        }
-        .container {
-            max-width: 500px;
-            margin: 50px auto;
-            padding: 20px;
-            background-color: #ffffff;
-            border-radius: 10px;
-            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
-        }
-        h1 {
-            text-align: center;
-            color: #333333;
-        }
-        form {
-            margin-top: 20px;
-        }
-        label {
-            font-weight: bold;
-            display: block;
-            margin-bottom: 10px;
-        }
-        select, input[type="submit"], button {
-            width: 100%;
-            padding: 12px;
-            margin-bottom: 20px;
-            border-radius: 5px;
-            border: 1px solid #ccc;
-            font-size: 16px;
-        }
-        input[type="submit"], button {
-            background-color: #007bff;
-            color: white;
-            cursor: pointer;
-            font-weight: bold;
-        }
-        input[type="submit"]:hover, button:hover {
-            background-color: #0056b3;
-        }
-        button:disabled, input[type="submit"]:disabled {
-            background-color: #6c757d;
-            cursor: not-allowed;
-        }
-        .alert {
-            padding: 15px;
-            background-color: #f44336;
-            color: white;
-            border-radius: 5px;
-            text-align: center;
-            margin-bottom: 15px;
-        }
-        .success {
-            background-color: #28a745;
-        }
-        .warning {
-            background-color: #ffc107;
-            color: #000;
-        }
-        .location-status {
-            padding: 10px;
-            border-radius: 5px;
-            margin-bottom: 15px;
-            text-align: center;
-            font-weight: bold;
-        }
-        .location-active {
-            background-color: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        .location-inactive {
-            background-color: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffeaa7;
-        }
-        .location-error {
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        .coordinates-display {
-            background-color: #f8f9fa;
-            padding: 10px;
-            border-radius: 5px;
-            margin-bottom: 15px;
-            font-family: monospace;
-            text-align: center;
-        }
-        .message {
-            text-align: center;
-            margin-bottom: 20px;
-        }
-        .back-button {
-            text-align: center;
-            margin-top: 20px;
-        }
-        .back-button a {
-            display: inline-block;
-            padding: 10px 20px;
-            background-color: #007bff;
-            color: white;
-            text-decoration: none;
-            border-radius: 5px;
-        }
-        .back-button a:hover {
-            background-color: #0056b3;
-        }
-        .accuracy-info {
-            font-size: 0.9em;
-            color: #6c757d;
-            text-align: center;
-            margin-top: -15px;
-            margin-bottom: 15px;
-        }
-        .user-info {
-            background-color: #e7f3ff;
-            padding: 10px;
-            border-radius: 5px;
-            margin-bottom: 15px;
-            text-align: center;
-            border-left: 4px solid #007bff;
-        }
-        .distance-results {
-            background-color: #e8f5e8;
-            border: 2px solid #4caf50;
-            border-radius: 10px;
-            padding: 20px;
-            margin: 20px 0;
-            text-align: center;
-        }
-        .distance-value {
-            font-size: 2em;
-            font-weight: bold;
-            color: #2e7d32;
-            margin: 10px 0;
-        }
-        .provider-info {
-            background-color: #fff3cd;
-            border: 1px solid #ffc107;
-            border-radius: 5px;
-            padding: 15px;
-            margin: 10px 0;
-        }
-        .token-info {
-            background-color: #e7f3ff;
-            border: 1px solid #007bff;
-            border-radius: 5px;
-            padding: 10px;
-            margin: 10px 0;
-            text-align: center;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Find Nearest Service Provider</h1>
-        <!-- Flash messages for feedback -->
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-
-        <!-- User Info Display for Logged-in Users -->
-        <div id="userInfo" class="user-info" style="display: none;">
-            Welcome back! <span id="userName">User</span>
-        </div>
-
-        <!-- Location Status Display -->
-        <div id="locationStatus" class="location-status location-inactive">
-            📍 Location: Click button to enable
-        </div>
-
-        <!-- Coordinates Display - HIDDEN AS REQUESTED -->
-        <div id="coordinatesDisplay" class="coordinates-display" style="display: none;">
-            Location detected successfully
-        </div>
-
-        <!-- Distance Results Display -->
-        <div id="distanceResults" class="distance-results" style="display: none;">
-            <h3>📍 Nearest Provider Found</h3>
-            <div class="distance-value" id="distanceValue">0.00 km</div>
-            <div class="provider-info">
-                <strong>Service Type:</strong> <span id="resultServiceType">-</span><br>
-                <strong>Phone Number:</strong> <span id="resultPhoneNumber">-</span><br>
-                <strong>Distance:</strong> <span id="resultDistance">-</span> away
-            </div>
-            <div class="token-info">
-                <strong>2 tokens deducted from your account</strong>
-            </div>
-        </div>
-
-        <form action="{{ url_for('find_nearest_service_provider') }}" method="POST" id="findServiceProviderForm">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            
-            <label for="service_type">Select Service Type</label>
-            <select name="service_type" id="service_type" required>
-                <option value="" disabled selected>Select a service</option>
-                <option value="Shamba">Shamba</option>
-                <option value="Nyumba">Nyumba</option>     
-            </select>
-
-            <!-- Automatically filled longitude and latitude -->
-            <input type="hidden" name="longitude" id="longitude" required>
-            <input type="hidden" name="latitude" id="latitude" required>
-
-            <!-- Auto-filled credentials for logged-in users -->
-            <input type="hidden" name="user_id" id="user_id">
-            <input type="hidden" name="auto_auth" id="auto_auth" value="true">
-
-            <!-- Enable Location Button -->
-            <button type="button" id="enableLocationBtn">📍 Enable Location to Search</button>
-
-            <input type="submit" id="submitBtn" value="Find Nearest Service Provider" disabled>
-
-            <div class="accuracy-info">
-                Better location accuracy = better search results
-            </div>
-        </form>
-
-        <div class="message">
-            <p><strong>How it works:</strong> We use your current location to find the closest service provider in your area.</p>
-            <p><strong>Cost:</strong> 2 tokens per search</p>
-        </div>
-
-        <div class="back-button">
-            <a href="{{ url_for('dashboard') }}">Back to Dashboard</a>
-        </div>
-    </div>
-
-    <script>
-        let hasLocation = false;
-        let currentCoordinates = null;
-        let isUserLoggedIn = false;
-        let userData = null;
-
-        document.addEventListener('DOMContentLoaded', function() {
-            const locationStatus = document.getElementById('locationStatus');
-            const coordinatesDisplay = document.getElementById('coordinatesDisplay');
-            const enableLocationBtn = document.getElementById('enableLocationBtn');
-            const submitBtn = document.getElementById('submitBtn');
-            const longitudeInput = document.getElementById('longitude');
-            const latitudeInput = document.getElementById('latitude');
-            const userInfo = document.getElementById('userInfo');
-            const userName = document.getElementById('userName');
-            const userIdInput = document.getElementById('user_id');
-            const distanceResults = document.getElementById('distanceResults');
-            const distanceValue = document.getElementById('distanceValue');
-            const resultServiceType = document.getElementById('resultServiceType');
-            const resultPhoneNumber = document.getElementById('resultPhoneNumber');
-            const resultDistance = document.getElementById('resultDistance');
-
-            // Check user authentication status
-            checkUserAuthentication();
-
-            // Check if geolocation is supported
-            if (!navigator.geolocation) {
-                locationStatus.textContent = '📍 Location: Not supported by your browser';
-                locationStatus.className = 'location-status location-error';
-                enableLocationBtn.disabled = true;
-                enableLocationBtn.textContent = 'Location Not Supported';
-                return;
-            }
-
-            // Enable Location Button Click Handler
-            enableLocationBtn.addEventListener('click', function() {
-                requestLocationAccess();
-            });
-
-            function checkUserAuthentication() {
-                // Check for existing session or stored credentials
-                const userSession = localStorage.getItem('user_session');
-                const authToken = localStorage.getItem('auth_token');
-                
-                if (userSession || authToken) {
-                    try {
-                        userData = userSession ? JSON.parse(userSession) : null;
-                        isUserLoggedIn = true;
-                        
-                        // Update UI for logged-in user
-                        userInfo.style.display = 'block';
-                        if (userData && userData.name) {
-                            userName.textContent = userData.name;
-                        }
-                        
-                        // Auto-fill user ID if available
-                        if (userData && userData.id) {
-                            userIdInput.value = userData.id;
-                        }
-                        
-                        console.log('User auto-authenticated');
-                    } catch (e) {
-                        console.log('No valid user session found');
-                    }
-                }
-                
-                // Additional check for server-side session
-                fetch('/check-auth', {
-                    method: 'GET',
-                    credentials: 'same-origin'
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.authenticated && data.user) {
-                        isUserLoggedIn = true;
-                        userData = data.user;
-                        userInfo.style.display = 'block';
-                        userName.textContent = userData.name || 'User';
-                        if (userData.id) {
-                            userIdInput.value = userData.id;
-                        }
-                    }
-                })
-                .catch(error => {
-                    console.log('Auth check failed, proceeding without auto-login');
-                });
-            }
-
-            function requestLocationAccess() {
-                locationStatus.textContent = '📍 Location: Detecting your location...';
-                locationStatus.className = 'location-status location-inactive';
-                enableLocationBtn.disabled = true;
-                enableLocationBtn.textContent = '🔄 Detecting...';
-                
-                // Request high accuracy location for better search results
-                navigator.geolocation.getCurrentPosition(
-                    // Success callback
-                    function(position) {
-                        const lat = position.coords.latitude;
-                        const lng = position.coords.longitude;
-                        const accuracy = position.coords.accuracy;
-                        
-                        // Store coordinates
-                        longitudeInput.value = lng;
-                        latitudeInput.value = lat;
-                        currentCoordinates = { lat, lng, accuracy };
-                        
-                        // Update UI - COORDINATES HIDDEN AS REQUESTED
-                        const accuracyText = accuracy < 50 ? 'High' : accuracy < 200 ? 'Medium' : 'Low';
-                        locationStatus.textContent = `📍 Location: Ready (${accuracyText} accuracy)`;
-                        locationStatus.className = 'location-status location-active';
-                        
-                        // Coordinates text removed from display
-                        coordinatesDisplay.style.display = 'block';
-                        
-                        enableLocationBtn.textContent = '🔄 Update My Location';
-                        enableLocationBtn.disabled = false;
-                        submitBtn.disabled = false;
-                        hasLocation = true;
-                        
-                        // Auto-focus the submit button for better UX
-                        submitBtn.focus();
-                    },
-                    // Error callback
-                    function(error) {
-                        handleLocationError(error);
-                    },
-                    // Options - high accuracy for better search
-                    {
-                        enableHighAccuracy: true,
-                        timeout: 15000,
-                        maximumAge: 30000
-                    }
-                );
-            }
-
-            function handleLocationError(error) {
-                let errorMessage = '📍 Location: ';
-                let userMessage = '';
-                
-                switch(error.code) {
-                    case error.PERMISSION_DENIED:
-                        errorMessage += 'Permission denied.';
-                        userMessage = 'Please allow location access in your browser settings to find nearby providers.';
-                        break;
-                    case error.POSITION_UNAVAILABLE:
-                        errorMessage += 'Location unavailable.';
-                        userMessage = 'Please check your device location settings and try again.';
-                        break;
-                    case error.TIMEOUT:
-                        errorMessage += 'Request timeout.';
-                        userMessage = 'Location detection took too long. Please try again.';
-                        break;
-                    default:
-                        errorMessage += 'Detection failed.';
-                        userMessage = 'Please try enabling location again.';
-                        break;
-                }
-                
-                locationStatus.textContent = errorMessage;
-                locationStatus.className = 'location-status location-error';
-                enableLocationBtn.textContent = '📍 Try Again';
-                enableLocationBtn.disabled = false;
-                submitBtn.disabled = true;
-                hasLocation = false;
-                
-                if (userMessage) {
-                    alert(userMessage);
-                }
-            }
-
-            // Process flash messages to display distance results
-            function processFlashMessages() {
-                const flashMessages = document.querySelectorAll('.alert');
-                flashMessages.forEach(message => {
-                    const messageText = message.textContent;
-                    
-                    // Check if this is a successful search result
-                    if (message.classList.contains('success') && messageText.includes('km away')) {
-                        // Extract information from the flash message
-                        const distanceMatch = messageText.match(/(\d+\.?\d*)\s*km/);
-                        const phoneMatch = messageText.match(/Contact: (\d+)/);
-                        const serviceMatch = messageText.match(/nearest (\w+)/);
-                        
-                        if (distanceMatch && phoneMatch) {
-                            const distance = distanceMatch[1];
-                            const phone = phoneMatch[1];
-                            const serviceType = serviceMatch ? serviceMatch[1] : 'Service';
-                            
-                            // Display the distance results
-                            distanceValue.textContent = `${distance} km`;
-                            resultServiceType.textContent = serviceType;
-                            resultPhoneNumber.textContent = phone;
-                            resultDistance.textContent = `${distance} km`;
-                            
-                            // Show the results section
-                            distanceResults.style.display = 'block';
-                            
-                            // Scroll to results
-                            distanceResults.scrollIntoView({ behavior: 'smooth' });
-                            
-                            // Hide the original flash message
-                            message.style.display = 'none';
-                        }
-                    }
-                });
-            }
-
-            // Run message processing after page load
-            setTimeout(processFlashMessages, 100);
-
-            // Prevent form submission if location is not available
-            document.getElementById('findServiceProviderForm').addEventListener('submit', function(event) {
-                if (!hasLocation || !longitudeInput.value || !latitudeInput.value) {
-                    event.preventDefault();
-                    alert('Please enable location services to find nearby providers.');
-                    enableLocationBtn.scrollIntoView({ behavior: 'smooth' });
-                } else {
-                    // Show loading state
-                    submitBtn.disabled = true;
-                    submitBtn.value = 'Searching... Please wait';
-                }
-            });
-
-            // Try to get location automatically on page load
-            setTimeout(() => {
-                if (!hasLocation) {
-                    navigator.geolocation.getCurrentPosition(
-                        function(position) {
-                            // Auto-success
-                            const lat = position.coords.latitude;
-                            const lng = position.coords.longitude;
-                            const accuracy = position.coords.accuracy;
-                            
-                            longitudeInput.value = lng;
-                            latitudeInput.value = lat;
-                            currentCoordinates = { lat, lng, accuracy };
-                            
-                            locationStatus.textContent = `📍 Location: Auto-detected`;
-                            locationStatus.className = 'location-status location-active';
-                            
-                            // Coordinates display updated without showing actual coordinates
-                            coordinatesDisplay.style.display = 'block';
-                            
-                            enableLocationBtn.textContent = '🔄 Update Location';
-                            submitBtn.disabled = false;
-                            hasLocation = true;
-                        },
-                        function(error) {
-                            // Silent fail - user will manually enable
-                            console.log('Auto-location failed for search');
-                        },
-                        {
-                            enableHighAccuracy: false,
-                            timeout: 8000,
-                            maximumAge: 60000
-                        }
-                    );
-                }
-            }, 500);
-        });
-    </script>
-</body>
-</html>
-"""
-
-search_user_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Search User</title>    
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: #f4f6f9;
-            color: #343a40;
-        }
-        .container {
-            width: 80%;
             max-width: 800px;
-            margin: 30px auto;
             padding: 20px;
-            background-color: #ffffff;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-            border-radius: 10px;
-        }
-        h1 {
+            background: rgba(0, 0, 0, 0.8);
+            border-radius: 15px;
             text-align: center;
-            font-size: 2.5em;
-            margin-bottom: 20px;
-            color: #007bff;
-        }
-        form {
-            background-color: #fff;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-        }
-        label {
-            font-size: 1.1em;
-            margin-bottom: 5px;
-            display: block;
-            color: #343a40;
-        }
-        input[type="text"],
-        input[type="submit"] {
-            width: 100%;
-            padding: 10px;
-            margin-bottom: 20px;
-            border: 1px solid #ced4da;
-            border-radius: 5px;
-            font-size: 1em;
             box-sizing: border-box;
         }
-        input[type="submit"] {
-            background-color: #007bff;
-            color: white;
-            border: none;
-            padding: 10px;
-            cursor: pointer;
-            font-size: 1.1em;
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 15px;
+            color: #ffcc00;
         }
-        input[type="submit"]:hover {
-            background-color: #0056b3;
+        h2 {
+            font-size: 1.5rem;
+            margin-top: 20px;
+            color: #ffcc00;
         }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Search User</h1>        
-        <form action="{{ url_for('search_user') }}" method="POST">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">        
-            <label for="username">Username:</label>
-            <input type="text" id="username" name="username" placeholder="Enter Username" required>
-            <input type="submit" value="Search">
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-view_user_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>User Details</title>    
-    <style>
         table {
             width: 100%;
             border-collapse: collapse;
-        }
-        table, th, td {
-            border: 1px solid black;
+            margin-bottom: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            overflow: hidden;
         }
         th, td {
             padding: 10px;
-            text-align: left;
+            border: 1px solid #ccc;
+            text-align: center;
         }
         th {
-            background-color: #f2f2f2;
+            background-color: #4CAF50;
+            color: white;
+        }
+        tr:nth-child(even) {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            text-align: left;
+        }
+        label {
+            font-size: 1rem;
+            font-weight: bold;
+            color: #ffcccb;
+        }
+        input, select, button {
+            padding: 10px;
+            font-size: 1rem;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        input {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+        input:focus {
+            border-color: #ff9900;
+            outline: none;
+        }
+        select {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+            border: none;
+            transition: background-color 0.3s ease;
+            font-weight: bold;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .error {
+            color: #ffcccb;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        a {
+            display: inline-block;
+            margin-top: 20px;
+            color: #ffcc00;
+            text-decoration: none;
+            font-weight: bold;
+            transition: color 0.3s ease;
+        }
+        a:hover {
+            color: #ff9900;
+            text-decoration: underline;
+        }
+
+        .monitor-btn {
+            margin-top: 25px;
+            padding: 12px;
+            background-color: #ff5722;
+            color: white;
+            font-weight: bold;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+        }
+        .monitor-btn:hover {
+            background-color: #e64a19;
+        }
+
+        .activity-table th {
+            background-color: #3f51b5;
+        }
+        
+        .cashbook-btn {
+            margin-top: 25px;
+            padding: 12px;
+            background-color: #2196F3;
+            color: white;
+            font-weight: bold;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+        }
+        .cashbook-btn:hover {
+            background-color: #1976D2;
         }
     </style>
 </head>
 <body>
-    <h1>User Details for {{ user_data[0] }}</h1>    
-    <table>
-        <tr>
-            <th>Username</th>
-            <td>{{ user_data[0] }}</td>
-        </tr>
-        <tr>
-            <th>Email</th>
-            <td>{{ user_data[1] }}</td>
-        </tr>
-        <tr>
-            <th>Role</th>
-            <td>{{ user_data[2] }}</td>
-        </tr>
-        <tr>
-            <th>Status</th>
-            <td>{{ user_data[3] }}</td>
-        </tr>
-        <tr>
-            <th>Created At</th>
-            <td>{{ user_data[4] }}</td>
-        </tr>
-        <tr>
-            <th>Last Interaction</th>
-            <td>{{ user_data[5] }}</td>
-        </tr>
-        <tr>
-            <th>Total Requests</th>
-            <td>{{ user_data[6] }}</td>
-        </tr>
-        <tr>
-            <th>Total Transactions</th>
-            <td>{{ user_data[7] }}</td>
-        </tr>
-        <tr>
-            <th>Used Voucher Code</th>
-            <td>{{ user_data[8] }}</td>
-        </tr>
-        <tr>
-            <th>Last Login Attempt</th>
-            <td>{{ user_data[9] }}</td>
-        </tr>
-        <tr>
-            <th>Successful Logins</th>
-            <td>{{ user_data[10] }}</td>
-        </tr>
-    </table>
+    <div class="container">
+        <h1>Admin Dashboard</h1>
+        {% if error %} <p class="error">{{ error }}</p> {% endif %}
+        {% if message %} <p class="message">{{ message }}</p> {% endif %}
 
-</body>
-</html>
-"""        
+        <h2>All Users</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Username</th>
+                    <th>Email</th>
+                    <th>Wallet Balance</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user in users %}
+                <tr>
+                    <td>{{ user[0] }}</td>
+                    <td>{{ user[2] }}</td>
+                    <td>{{ user[1] }}</td>
+                    <td>Ksh. {{ user[4] | round(2) }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <h2>Update User Wallet</h2>
+        <form method="POST" action="/admin/update_wallet">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="user_id">User ID:</label>
+            <input type="text" id="user_id" name="user_id" required>
+            <label for="amount">Amount:</label>
+            <input type="number" id="amount" name="amount" step="0.01" required>
+            <label for="action">Action:</label>
+            <select id="action" name="action" required>
+                <option value="deposit">Deposit</option>
+                <option value="withdraw">Withdraw</option>
+            </select>
+            <button type="submit">Update Wallet</button>
+        </form>
+
+        <h2>Add Allowed Username</h2>
+        <form method="POST" action="/admin/add_allowed_user">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="allowed_username">Username:</label>
+            <input type="text" id="allowed_username" name="allowed_username" required>
+            <button type="submit">Add Allowed User</button>
+        </form>
+
+        <button class="monitor-btn" onclick="window.location.href='/admin/visitor_log'">View Visitor Log</button>
+        <button class="cashbook-btn" onclick="window.location.href='/cashbook'">ðŸ’° View Gross Profit Dashboard</button>
+
+        <h2>Recent User Activity (Last 100)</h2>
+        <table class="activity-table">
+            <thead>
+                <tr>
+                    <th>Timestamp</th>
+                    <th>Username</th>
+                    <th>IP</th>
+                    <th>Path</th>
+                    <th>Method</th>
+                    <th>User Agent</th>
+                    <th>Referrer</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in logs %}
+                <tr>
+                    <td>{{ log[1] }}</td>
+                    <td>{{ log[2] or 'Guest' }}</td>
+                    <td>{{ log[3] }}</td>
+                    <td>{{ log[4] }}</td>
+                    <td>{{ log[5] }}</td>
+                    <td>{{ log[6][:60] }}{% if log[6]|length > 60 %}...{% endif %}</td>
+                    <td>{{ log[7] or '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
         
-
-#Function to generate HTML error message
-def generate_html_message(title, message):
-    """Generate an HTML page for error messages."""
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title}</title>
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-            text-align: center;
-            padding: 20px;
-            color: #333;
-        }}
-        h1 {{
-            color: #4285f4;
-        }}
-        .message {{
-            border: 2px solid #4285f4;
-            padding: 10px;
-            max-width: 400px;
-            margin: auto;
-            background-color: #fff;
-        }}
-    </style>
-</head>
-<body>
-    <div class="message">
-        <h1>{title}</h1>
-        <p>{message}</p>
+        <button class="cashbook-btn" onclick="window.location.href='/admin/withdrawals'" 
+                style="background-color: #9C27B0; margin-top: 15px;">
+            ðŸ’³ Manage Withdrawals
+        </button>
+        
+        <a href="/admin/logout">Logout</a>
     </div>
+    <script>
+    // Auto-refresh admin data every 1 hour
+    function refreshAdminData() {
+        location.reload();
+    }
+
+    // 1 hour = 60 minutes * 60 seconds * 1000 milliseconds
+    setTimeout(refreshAdminData, 3600000);
+
+    // Auto-clear admin messages after 1 hour
+    setTimeout(() => {
+        const errorElements = document.querySelectorAll('.error');
+        const messageElements = document.    querySelectorAll('.message');
+    
+        errorElements.forEach(el => el.style.display = 'none');
+        messageElements.forEach(el => el.style.display = 'none');
+    }, 3600000);
+    </script>
 </body>
 </html>
 """
-    
+
+TERMS_CONTENT = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
+     crossorigin="anonymous"></script>
+    <meta charset="UTF-8">
+    <title>Terms and Conditions | Harambee Cash</title> 
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f2f2f2;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 {
+            text-align: center;
+            color: #006400;
+        }
+        p, li {
+            line-height: 1.6;
+            font-size: 16px;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        footer {
+            text-align: center;
+            margin-top: 30px;
+            font-size: 14px;
+            color: #666;
+        }
+        a {
+            display: block;
+            text-align: center;
+            margin-top: 20px;
+            color: #006400;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .container {
+            background: #fff;
+            padding: 25px;
+            border-radius: 10px;
+            max-width: 800px;
+            margin: 0 auto;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Terms and Conditions</h1>
+        
+        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
+        crossorigin="anonymous"></script>
+        <ins class="adsbygoogle"
+            style="display:block"
+            data-ad-client="ca-pub-5190046541953794"
+            data-ad-slot="2953235853"
+            data-ad-format="auto"
+            data-full-width-responsive="true"></ins>
+        <script>
+            (adsbygoogle = window.adsbygoogle || []).push({});
+        </script>      
+        
+        <p><strong>Last Updated:</strong> 6th February 2025</p>
+        <p>Welcome to <strong>Harambee Cash</strong> â€” your platform for exciting gameplay and rewards! Before getting started, please read through our Terms and Conditions carefully. By using our platform, you agree to these terms.</p>
+
+        <h3>1. Acceptance of Terms</h3>
+        <p>By accessing or using Harambee Cash, you agree to comply with these Terms and Conditions. If you do not agree with any part, please do not use the platform.</p>
+
+        <h3>2. Eligibility</h3>
+        <ul>
+            <li>You must be at least 18 years old to participate.</li>
+            <li>You are responsible for providing accurate and updated information during registration.</li>
+        </ul>
+
+        <h3>3. Account Registration</h3>
+        <ul>
+            <li>An account is required to access the platform's features.</li>
+            <li>Keep your login credentials secureâ€”you are accountable for all activity under your account.</li>
+        </ul>
+
+        <h3>4. Game Rules</h3>
+        <ul>
+            <li>A minimum wallet balance of Ksh. 1.00 is required to participate.</li>
+            <li>The game runs every 30 seconds. You can join anytime by pressing the <strong>Play</strong> button.</li>
+            <li>10% of the prize pool is deducted as a platform fee; the rest is awarded to the winner.</li>
+        </ul>
+
+        <h3>5. Wallet and Transactions</h3>
+        <ul>
+            <li>You may deposit or withdraw funds via the platform.</li>
+            <li>If automation fails or is undergoing maintenance, you may contact the <strong>Super Admin</strong> listed in the app for assistance.</li>
+            <li>Transaction history is available upon request.</li>
+        </ul>
+
+        <h3>6. Prohibited Activities</h3>
+        <ul>
+            <li>Fraudulent or illegal activities are strictly prohibited.</li>
+            <li>Any manipulation or abuse of the game system will result in account suspension and possible legal action.</li>
+        </ul>
+
+        <h3>7. Limitation of Liability</h3>
+        <p>Harambee Cash is provided "as is." We do not guarantee uninterrupted service and are not responsible for any losses or damages incurred through platform use.</p>
+
+        <h3>8. Amendments</h3>
+        <p>We may update these terms from time to time. Continued use of the platform indicates your acceptance of any changes.</p>
+
+        <footer>
+            <p>&copy; 2025 Pigasimu. All rights reserved.</p>
+        </footer>
+        <a href="/">â† Back to Home</a>
+    </div> 
+</body>
+</html>
+"""
+
+PRIVACY_CONTENT = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
+     crossorigin="anonymous"></script>
+    <meta charset="UTF-8">
+    <title>Privacy Policy | Harambee Cash</title>    
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f2f2f2;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 {
+            text-align: center;
+            color: #006400;
+        }
+        p, li {
+            line-height: 1.6;
+            font-size: 16px;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        footer {
+            text-align: center;
+            margin-top: 30px;
+            font-size: 14px;
+            color: #666;
+        }
+        a {
+            display: block;
+            text-align: center;
+            margin-top: 20px;
+            color: #006400;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .container {
+            background: #fff;
+            padding: 25px;
+            border-radius: 10px;
+            max-width: 800px;
+            margin: 0 auto;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Privacy Policy</h1>
+        
+        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
+        crossorigin="anonymous"></script>
+        <ins class="adsbygoogle"
+            style="display:block"
+            data-ad-client="ca-pub-5190046541953794"
+            data-ad-slot="2953235853"
+            data-ad-format="auto"
+            data-full-width-responsive="true"></ins>
+        <script>
+            (adsbygoogle = window.adsbygoogle || []).push({});
+        </script>        
+        
+        <p><strong>Last Updated:</strong> 6th February 2025</p>
+        <p>At <strong>Harambee Cash</strong>, your privacy is a top priority. This Privacy Policy outlines how we collect, use, and protect your personal data when you interact with our platform.</p>
+
+        <h3>1. Information We Collect</h3>
+        <ul>
+            <li><strong>Personal Information:</strong> Such as your email, username, and password during registration.</li>
+            <li><strong>Financial Information:</strong> Including your wallet balance and transaction history.</li>
+            <li><strong>Usage Data:</strong> Such as login timestamps, game activity, and IP addresses.</li>
+        </ul>
+
+        <h3>2. How We Use Your Information</h3>
+        <ul>
+            <li>To operate, maintain, and improve the platform experience.</li>
+            <li>To process payments, update wallet balances, and manage your account.</li>
+            <li>To communicate with you about updates, support, or promotional offers.</li>
+        </ul>
+
+        <h3>3. Data Security</h3>
+        <ul>
+            <li>We use industry-standard security protocols to safeguard your information.</li>
+            <li>Passwords are encrypted and not accessible to anyone, including our team.</li>
+        </ul>
+
+        <h3>4. Third-Party Sharing</h3>
+        <p>We do not sell or share your personal data with third parties unless required by law.</p>
+
+        <h3>5. Cookies</h3>
+        <p>Our site uses cookies to enhance your experience. You can manage cookie settings in your browser, though disabling them may impact site functionality.</p>
+
+        <h3>6. Your Rights</h3>
+        <ul>
+            <li>You may request to access, update, or delete your personal data at any time.</li>
+            <li>You may opt out of promotional emails and notifications if applicable.</li>
+        </ul>
+
+        <h3>7. Changes to This Policy</h3>
+        <p>We may revise this policy periodically. Any updates will be published on this page, and your continued use of the platform indicates your acceptance.</p>
+
+        <footer>
+            <p>&copy; 2025 Pigasimu. All rights reserved.</p>
+        </footer>
+        <a href="/">â† Back to Home</a>
+    </div>   
+</body>
+</html>
+"""
+
+DOCS_CONTENT = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
+     crossorigin="anonymous"></script>
+    <meta charset="UTF-8">
+    <title>Documentation | Harambee Cash</title>    
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f4f4;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 {
+            text-align: center;
+            color: #006400;
+        }
+        h2 {
+            margin-top: 30px;
+            color: #444;
+        }
+        p, li {
+            line-height: 1.6;
+            font-size: 16px;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        .container {
+            background: #fff;
+            padding: 25px;
+            border-radius: 10px;
+            max-width: 900px;
+            margin: auto;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        a {
+            display: block;
+            text-align: center;
+            margin-top: 30px;
+            color: #006400;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Harambee Cash Documentation</h1>
+        
+        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-5190046541953794"
+        crossorigin="anonymous"></script>
+        <ins class="adsbygoogle"
+            style="display:block"
+            data-ad-client="ca-pub-5190046541953794"
+            data-ad-slot="2953235853"
+            data-ad-format="auto"
+            data-full-width-responsive="true"></ins>
+        <script>
+            (adsbygoogle = window.adsbygoogle || []).push({});
+        </script>        
+
+        <h2>Overview</h2>
+        <p>
+            Harambee Cash is a web-based platform for participating in periodic games where winners are selected randomly from eligible users.
+            The system supports user registration, wallet management, and administrative tools.
+        </p>
+
+        <h2>Key Features</h2>
+        <ul>
+            <li><strong>User Registration & Login:</strong> Users sign up with email, username, and password. Passwords are securely stored.</li>
+            <li><strong>Wallet Management:</strong> Users can view their balances. Admins can deposit or withdraw funds.</li>
+            <li><strong>Game Logic:</strong> A game runs every 30 seconds. Users with at least Ksh. 1.00 can enroll. A 10% fee is deducted from the pool; the winner gets the rest.</li>
+            <li><strong>Admin Dashboard:</strong> Admins can manage users, view wallets, and process funds, especially for winners, until mobile money integration is complete (currently in progress).</li>
+        </ul>
+
+        <h2>Database Schema</h2>
+        <ul>
+            <li><strong>Users Table:</strong> Stores user data (email, username, password, wallet balance).</li>
+            <li><strong>Admins Table:</strong> Stores admin login info.</li>
+            <li><strong>Results Table:</strong> Logs game data (code, time, winner, pool amount, etc.).</li>
+            <li><strong>Transactions Table:</strong> Tracks all wallet operations (type, amount, time).</li>
+        </ul>
+
+        <h2>API Endpoints</h2>
+        <ul>
+            <li><strong>GET /</strong> â€“ Homepage</li>
+            <li><strong>POST /register</strong> â€“ Register a new user</li>
+            <li><strong>POST /login</strong> â€“ User login</li>
+            <li><strong>GET /logout</strong> â€“ User logout</li>
+            <li><strong>POST /play</strong> â€“ Enroll in next game</li>
+            <li><strong>GET /admin/login</strong> â€“ Admin login</li>
+            <li><strong>GET /admin/dashboard</strong> â€“ Admin panel</li>
+            <li><strong>GET /admin/logout</strong> â€“ Admin logout</li>
+        </ul>
+
+        <h2>Security Measures</h2>
+        <ul>
+            <li>Session timeout: 30-minute expiration for inactive users</li>
+            <li>Password hashing using <code>bcrypt</code> (to be implemented)</li>
+            <li>Input validation to prevent SQL injection and other attacks</li>
+        </ul>
+
+        <h2>Our future Enhancements plan</h2>
+        <ul>
+            <li>Sell APIs to startup developers to help them run similar businesses independently</li>
+            <li>Provide employment opportunities through platform expansion</li>
+            <li>Introduce periodic rewards or bonuses for highly active users</li>
+            <li>Add email verification during signup</li>
+            <li>Introduce 2FA (Two-Factor Authentication) for admins</li>
+            <li>Complete mobile money integration for automatic payouts</li>
+            <li>Introduce a referral system to reward users for inviting friends</li>
+            <li>Add in-app notifications for game results, balance alerts, and new features</li>
+            <li>Implement leaderboards and achievement badges to encourage competition</li>
+            <li>Develop native mobile apps for Android and iOS users</li>
+            <li>Integrate a real-time support chatbot for instant help and FAQs</li>
+            <li>Enable downloadable transaction receipts and full account statements</li>
+            <li>Add multi-language support for local and global audiences</li>
+            <li>Build an advanced admin analytics dashboard for insights and reporting</li>
+            <li>Launch an affiliate/franchise system for regional expansion via trusted agents</li>
+            <li>Introduce user feedback and voting tools to guide new feature development</li>
+        </ul>     
+
+        <footer>
+            <p>&copy; 2025 Pigasimu. All rights reserved.</p>
+        </footer>
+        <a href="/">â† Back to Home</a>
+    </div>   
+</body>
+</html>
+"""
+
+# --- Background game loop start ---
+game_thread_started = False
+
+@app.before_request
+def start_background_game_loop():
+    global game_thread_started
+    if not game_thread_started:
+        game_thread_started = True
+        thread = threading.Thread(target=run_game, daemon=True, name="GameWorker")
+        thread.start()
+        logging.info("Game worker thread started")
+        
+# --- Run ---
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    app.run(debug=True, host="127.0.0.1", port=5000)        

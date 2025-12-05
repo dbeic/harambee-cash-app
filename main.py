@@ -971,11 +971,11 @@ def cashbook():
             total_gross_profit = float(result[0]) if result and result[0] is not None else 0.0
             total_gross_profit = max(0.0, total_gross_profit)  # Ensure no negative
             
-            # 2. Total User Balance (User Property)
+            # 2. Total User Balance (User Property) - *** ONLY CHANGE HERE ***
             cursor.execute("""
-                SELECT COALESCE(SUM(balance), 0) 
+                SELECT COALESCE(SUM(wallet), 0) 
                 FROM users 
-                WHERE status = 'active'
+                -- WHERE status = 'active'  -- REMOVED because no status column
             """)
             result = cursor.fetchone()
             total_user_balance = float(result[0]) if result and result[0] is not None else 0.0
@@ -1021,7 +1021,7 @@ def cashbook():
             "total_gross_profit": total_gross_profit,
             "total_user_balance": total_user_balance,
             "total_profitable_games": total_profitable_games,
-            "recent_profits": safe_recent_profits
+            "recent_profits": safe_recent_profits  # Keep this format
         }
         
         return render_template_string(cashbook_html, data=cashbook_data)
@@ -2553,7 +2553,6 @@ deposit_html = """
 </html>
 """                              
 
-
 cashbook_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -2783,6 +2782,7 @@ cashbook_html = """
 </body>
 </html>
 """
+
 
 base_html = """
 <!DOCTYPE html>

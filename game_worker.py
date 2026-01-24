@@ -75,7 +75,7 @@ def process_in_progress_game():
             players = cursor.fetchall()
             num_players = len(players)
 
-            if num_players >= 2:
+            if num_players >= 10:
                 success = process_game_round(players, game_code)
                 if not success:
                     cursor.execute("""
@@ -97,7 +97,7 @@ def process_in_progress_game():
 
 def process_game_round(players, game_code):
     """Process a single game round with accurate financial calculations"""
-    if not players or len(players) < 2:
+    if not players or len(players) < 10:
         logging.error(f"Game {game_code}: Insufficient players")
         return False
 
@@ -120,7 +120,7 @@ def process_game_round(players, game_code):
                 else:
                     logging.warning(f"User {username} no longer has sufficient balance")
             
-            if len(valid_players) < 2:
+            if len(valid_players) < 10:
                 logging.error(f"Game {game_code}: Not enough players with sufficient balance after verification")
                 cursor.execute("ROLLBACK")
                 return False

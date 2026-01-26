@@ -5046,6 +5046,14 @@ admin_html = """
             <input type="text" id="allowed_username" name="allowed_username" required>
             <button type="submit">Add Allowed User</button>
         </form>
+        
+<div class="control-form">
+    <h3>🤖 Auto-Player</h3>
+    <p>Manage automated fake players</p>
+    <a href="/admin/auto_player" class="btn" style="background: #9C27B0; color: white; text-decoration: none; display: block; text-align: center; padding: 10px;">
+        🤖 Auto-Player Control
+    </a>
+</div>        
 
         <button class="monitor-btn" onclick="window.location.href='/admin/visitor_log'">View Visitor Log</button>
         <button class="cashbook-btn" onclick="window.location.href='/cashbook'">ðŸ’° View Gross Profit Dashboard</button>
@@ -5053,7 +5061,12 @@ admin_html = """
         <button class="cashbook-btn" onclick="window.location.href='/admin/withdrawals'" 
                 style="background-color: #9C27B0; margin-top: 15px;">
             ðŸ’³ Manage Withdrawals
-        </button>        
+        </button>
+        
+        <button class="cashbook-btn" onclick="window.location.href='/admin/fake_users'" 
+                style="background-color: #FF9800; margin-top: 15px;">
+            🤖 Manage Fake Users
+        </button>                        
 
         <h2>Recent User Activity (Last 50)</h2>
         <table class="activity-table">
@@ -6393,21 +6406,6 @@ auto_player_html = """
     {% endif %}
 </body>
 </html>
-"""
-
-# ============================
-# ADD TO ADMIN DASHBOARD
-# ============================
-
-# Add this button to your admin_dashboard function in the action grid:
-"""
-<div class="control-form">
-    <h3>🤖 Auto-Player</h3>
-    <p>Manage automated fake players</p>
-    <a href="/admin/auto_player" class="btn" style="background: #9C27B0; color: white; text-decoration: none; display: block; text-align: center; padding: 10px;">
-        🤖 Auto-Player Control
-    </a>
-</div>
 """
 
 # ============================

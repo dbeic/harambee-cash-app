@@ -25,6 +25,7 @@ from flask_wtf.csrf import CSRFProtect
 from datetime import datetime, timedelta, timezone
 from game_worker import run_game
 from shared import get_db_connection
+import uuid
 
 load_dotenv()
 
@@ -87,6 +88,308 @@ def get_timestamp():
 def generate_game_code():
     import string
     return ''.join(random.choices(string.ascii_uppercase + '0123456789', k=6))
+    
+    
+# ============================
+# AUTO-PLAYER FUNCTIONALITY
+# ============================
+
+# Global variables for auto-player management
+auto_player_status = {
+    'enabled': False,
+    'thread': None,
+    'stop_event': threading.Event(),
+    'fake_users_created': False,
+    'fake_users_count': 0
+}
+
+# Add this table for auto-player control
+def init_auto_player_tables():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS auto_player_settings (
+                id SERIAL PRIMARY KEY,
+                enabled BOOLEAN DEFAULT FALSE,
+                fake_users_created BOOLEAN DEFAULT FALSE,
+                play_interval_seconds INTEGER DEFAULT 30,
+                min_balance_threshold DECIMAL DEFAULT 100.00,
+                max_balance_threshold DECIMAL DEFAULT 10000.00,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS fake_users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                hashed_password VARCHAR(255) NOT NULL,
+                wallet DECIMAL(10,2) DEFAULT 5000.00,
+                is_fake BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fake_users_is_fake ON fake_users(is_fake)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fake_users_username ON fake_users(username)")
+        
+        # Initialize settings
+        cursor.execute("SELECT COUNT(*) FROM auto_player_settings")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO auto_player_settings (enabled, fake_users_created, play_interval_seconds) 
+                VALUES (FALSE, FALSE, 30)
+            """)
+        conn.commit()
+
+# Call this in init_db() or separately
+init_auto_player_tables()
+
+def generate_fake_username():
+    """Generate a random username for fake players"""
+    prefixes = ['player', 'gamer', 'winner', 'lucky', 'happy', 'quick', 'smart', 'bold']
+    suffixes = ['01', '22', '33', '44', '55', '66', '77', '88', '99', '007']
+    return f"{random.choice(prefixes)}{random.choice(suffixes)}{random.randint(100, 999)}"
+
+def generate_fake_email(username):
+    """Generate email from username"""
+    domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'example.com']
+    return f"{username}@{random.choice(domains)}"
+
+def create_fake_users(count=50):
+    """Create specified number of fake users with initial balance"""
+    try:
+        created_count = 0
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            for i in range(count):
+                # Generate unique credentials
+                username = f"bot_{generate_fake_username()}_{i}"
+                email = generate_fake_email(username)
+                
+                # Check if username/email already exists
+                cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", (username, email))
+                if cursor.fetchone():
+                    continue
+                
+                # Create fake user with default password
+                hashed_password = generate_password_hash("FakeUser@123")
+                
+                cursor.execute("""
+                    INSERT INTO users (username, email, hashed_password, wallet, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (username, email, hashed_password, 5000.00, datetime.now()))
+                
+                user_id = cursor.fetchone()[0]
+                
+                # Also add to fake_users table for tracking
+                cursor.execute("""
+                    INSERT INTO fake_users (username, email, hashed_password, wallet, is_fake)
+                    VALUES (%s, %s, %s, %s, TRUE)
+                """, (username, email, hashed_password, 5000.00))
+                
+                created_count += 1
+            
+            # Update settings
+            cursor.execute("""
+                UPDATE auto_player_settings 
+                SET fake_users_created = TRUE, last_updated = CURRENT_TIMESTAMP
+            """)
+            
+            conn.commit()
+        
+        auto_player_status['fake_users_created'] = True
+        auto_player_status['fake_users_count'] = created_count
+        return created_count
+        
+    except Exception as e:
+        logging.error(f"Error creating fake users: {e}")
+        return 0
+
+def get_active_fake_users():
+    """Get list of active fake users with sufficient balance"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT u.id, u.username, u.wallet 
+                FROM users u
+                JOIN fake_users f ON u.username = f.username
+                WHERE u.wallet >= 1.00 
+                AND f.is_fake = TRUE
+                ORDER BY RANDOM()
+                LIMIT 50
+            """)
+            return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"Error getting fake users: {e}")
+        return []
+
+def simulate_play_for_fake_user(user_id, username):
+    """Simulate a play action for a fake user"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Check if already in queue
+            cursor.execute("SELECT 1 FROM game_queue WHERE user_id = %s", (user_id,))
+            if cursor.fetchone():
+                return False, "Already in queue"
+            
+            # Check balance
+            cursor.execute("SELECT wallet FROM users WHERE id = %s", (user_id,))
+            result = cursor.fetchone()
+            if not result or float(result[0]) < 1.0:
+                return False, "Insufficient funds"
+            
+            # Deduct play amount
+            cursor.execute("""
+                UPDATE users 
+                SET wallet = wallet - 1.0 
+                WHERE id = %s AND wallet >= 1.0
+                RETURNING wallet
+            """, (user_id,))
+            
+            updated = cursor.fetchone()
+            if not updated:
+                return False, "Transaction failed"
+            
+            # Record transaction
+            cursor.execute("""
+                INSERT INTO transactions (user_id, type, amount, timestamp)
+                VALUES (%s, 'game_entry', %s, %s)
+            """, (user_id, -1.0, datetime.now()))
+            
+            # Add to game queue
+            cursor.execute("""
+                INSERT INTO game_queue (user_id, timestamp)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+            """, (user_id, datetime.now()))
+            
+            conn.commit()
+            
+            logging.info(f"Fake user {username} enrolled in game. New balance: {float(updated[0]):.2f}")
+            return True, "Enrolled successfully"
+            
+    except Exception as e:
+        logging.error(f"Error simulating play for fake user {username}: {e}")
+        return False, str(e)
+
+def auto_player_worker():
+    """Worker thread that automatically plays games for fake users"""
+    logging.info("Auto-player worker started")
+    
+    while not auto_player_status['stop_event'].is_set():
+        try:
+            if not auto_player_status['enabled']:
+                time.sleep(5)
+                continue
+            
+            # Get active fake users
+            fake_users = get_active_fake_users()
+            if not fake_users:
+                logging.warning("No active fake users found")
+                time.sleep(30)
+                continue
+            
+            # Simulate plays for random subset of fake users
+            users_to_play = random.sample(fake_users, min(len(fake_users), random.randint(5, 15)))
+            
+            for user_id, username, wallet in users_to_play:
+                if auto_player_status['stop_event'].is_set():
+                    break
+                
+                success, message = simulate_play_for_fake_user(user_id, username)
+                if success:
+                    logging.debug(f"Auto-play successful for {username}")
+                else:
+                    logging.debug(f"Auto-play failed for {username}: {message}")
+                
+                # Random delay between plays (more human-like)
+                time.sleep(random.uniform(0.5, 2.0))
+            
+            # Wait for next cycle
+            time.sleep(30)  # Align with game cycles
+            
+        except Exception as e:
+            logging.error(f"Error in auto-player worker: {e}")
+            time.sleep(10)
+    
+    logging.info("Auto-player worker stopped")
+
+def start_auto_player():
+    """Start the auto-player system"""
+    if auto_player_status['thread'] and auto_player_status['thread'].is_alive():
+        return False, "Auto-player already running"
+    
+    auto_player_status['stop_event'].clear()
+    auto_player_status['enabled'] = True
+    
+    # Update database settings
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE auto_player_settings SET enabled = TRUE, last_updated = CURRENT_TIMESTAMP")
+        conn.commit()
+    
+    # Start worker thread
+    auto_player_status['thread'] = threading.Thread(
+        target=auto_player_worker,
+        daemon=True,
+        name="AutoPlayerWorker"
+    )
+    auto_player_status['thread'].start()
+    
+    logging.info("Auto-player started")
+    return True, "Auto-player started successfully"
+
+def stop_auto_player():
+    """Stop the auto-player system"""
+    auto_player_status['enabled'] = False
+    auto_player_status['stop_event'].set()
+    
+    # Update database settings
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE auto_player_settings SET enabled = FALSE, last_updated = CURRENT_TIMESTAMP")
+        conn.commit()
+    
+    if auto_player_status['thread']:
+        auto_player_status['thread'].join(timeout=5)
+    
+    logging.info("Auto-player stopped")
+    return True, "Auto-player stopped successfully"
+
+def get_auto_player_status():
+    """Get current auto-player status"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT enabled, fake_users_created, play_interval_seconds FROM auto_player_settings")
+            settings = cursor.fetchone()
+            
+            cursor.execute("SELECT COUNT(*) FROM fake_users")
+            fake_count = cursor.fetchone()[0] or 0
+            
+            cursor.execute("SELECT COUNT(*) FROM fake_users f JOIN users u ON f.username = u.username WHERE u.wallet >= 1.00")
+            active_count = cursor.fetchone()[0] or 0
+            
+        return {
+            'enabled': settings[0] if settings else False,
+            'fake_users_created': settings[1] if settings else False,
+            'play_interval': settings[2] if settings else 30,
+            'fake_users_count': fake_count,
+            'active_fake_users': active_count,
+            'worker_running': auto_player_status['thread'] and auto_player_status['thread'].is_alive() if auto_player_status['thread'] else False
+        }
+    except Exception as e:
+        logging.error(f"Error getting auto-player status: {e}")
+        return {}                
 
 # --- Database initialization ---
 def init_db():
@@ -524,7 +827,92 @@ def register():
 
     # GET request â€” show registration form
     return render_template_string(register_html)
+    
+# ============================
+# ADMIN ROUTES FOR AUTO-PLAYER
+# ============================
 
+@app.route("/admin/auto_player", methods=["GET", "POST"])
+@login_required(role='admin')
+@limiter.limit("50 per hour")
+def admin_auto_player():
+    """Admin control panel for auto-player"""
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login", error="Unauthorized access."))
+    
+    message = None
+    error = None
+    
+    if request.method == "POST":
+        action = request.form.get("action")
+        
+        if action == "create_users":
+            count = int(request.form.get("count", 50))
+            created = create_fake_users(count)
+            if created > 0:
+                message = f"Successfully created {created} fake users with Ksh. 5,000 each"
+            else:
+                error = "Failed to create fake users"
+        
+        elif action == "start":
+            success, msg = start_auto_player()
+            if success:
+                message = msg
+            else:
+                error = msg
+        
+        elif action == "stop":
+            success, msg = stop_auto_player()
+            if success:
+                message = msg
+            else:
+                error = msg
+        
+        elif action == "refill_balances":
+            amount = float(request.form.get("amount", 5000.00))
+            success, msg = refill_fake_user_balances(amount)
+            if success:
+                message = msg
+            else:
+                error = msg
+    
+    # Get current status
+    status = get_auto_player_status()
+    
+    return render_template_string(auto_player_html, 
+                                 status=status,
+                                 message=message,
+                                 error=error)
+
+def refill_fake_user_balances(amount=5000.00):
+    """Refill fake user wallets to specified amount"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Update users table
+            cursor.execute("""
+                UPDATE users u
+                SET wallet = %s
+                FROM fake_users f
+                WHERE u.username = f.username 
+                AND f.is_fake = TRUE
+            """, (amount,))
+            
+            # Update fake_users table
+            cursor.execute("""
+                UPDATE fake_users 
+                SET wallet = %s, last_updated = CURRENT_TIMESTAMP
+                WHERE is_fake = TRUE
+            """, (amount,))
+            
+            conn.commit()
+        
+        return True, f"Refilled all fake user wallets to Ksh. {amount:.2f}"
+    except Exception as e:
+        logging.error(f"Error refilling fake user balances: {e}")
+        return False, "Failed to refill balances"
+    
 
 @app.route("/offline")
 def offline():
@@ -5560,6 +5948,563 @@ DOCS_CONTENT = """
 </html>
 """
 
+
+# ============================
+# AUTO-PLAYER HTML TEMPLATE
+# ============================
+
+auto_player_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auto-Player Control - HARAMBEE CASH!</title>
+    <style>
+        :root {
+            --primary-dark: #1a1a2e;
+            --secondary-dark: #16213e;
+            --accent-gold: #ffcc00;
+            --success-green: #4CAF50;
+            --warning-orange: #FF9800;
+            --error-red: #f44336;
+            --info-blue: #2196F3;
+            --text-light: #FFFFFF;
+            --text-muted: #CCCCCC;
+            --card-bg: rgba(0, 0, 0, 0.7);
+            --border-radius: 12px;
+            --shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+            --transition: all 0.3s ease;
+        }
+        
+        body {
+            font-family: 'Segoe UI', 'Roboto', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #43cea2, #185a9d);
+            color: var(--text-light);
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: var(--card-bg);
+            padding: 30px;
+            border-radius: var(--border-radius);
+            box-shadow: var(--shadow);
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid var(--accent-gold);
+        }
+        
+        .header h1 {
+            color: var(--accent-gold);
+            margin: 0 0 10px 0;
+            font-size: 2.2rem;
+        }
+        
+        .header p {
+            color: var(--text-muted);
+            font-size: 1rem;
+        }
+        
+        /* Status Dashboard */
+        .status-dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .status-card {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 20px;
+            border-radius: var(--border-radius);
+            border-left: 4px solid var(--accent-gold);
+        }
+        
+        .status-card h3 {
+            color: var(--accent-gold);
+            margin: 0 0 10px 0;
+            font-size: 1.1rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .status-value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin: 10px 0;
+        }
+        
+        .status-enabled { color: var(--success-green); }
+        .status-disabled { color: var(--error-red); }
+        .status-count { color: var(--info-blue); }
+        
+        /* Control Panel */
+        .control-panel {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 25px;
+            border-radius: var(--border-radius);
+            margin-bottom: 30px;
+        }
+        
+        .control-panel h2 {
+            color: var(--accent-gold);
+            margin: 0 0 20px 0;
+            font-size: 1.5rem;
+        }
+        
+        .control-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .control-form {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 20px;
+            border-radius: var(--border-radius);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .control-form h3 {
+            color: var(--accent-gold);
+            margin: 0 0 15px 0;
+            font-size: 1.2rem;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--text-muted);
+            font-weight: 600;
+        }
+        
+        input, select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-light);
+            border-radius: 6px;
+            font-size: 1rem;
+        }
+        
+        input:focus, select:focus {
+            outline: none;
+            border-color: var(--accent-gold);
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            width: 100%;
+            margin-top: 10px;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, var(--success-green), #45a049);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: linear-gradient(135deg, #45a049, #388e3c);
+            transform: translateY(-2px);
+        }
+        
+        .btn-warning {
+            background: linear-gradient(135deg, var(--warning-orange), #F57C00);
+            color: white;
+        }
+        
+        .btn-warning:hover {
+            background: linear-gradient(135deg, #F57C00, #E65100);
+            transform: translateY(-2px);
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, var(--error-red), #d32f2f);
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: linear-gradient(135deg, #d32f2f, #b71c1c);
+            transform: translateY(-2px);
+        }
+        
+        .btn-info {
+            background: linear-gradient(135deg, var(--info-blue), #1976D2);
+            color: white;
+        }
+        
+        .btn-info:hover {
+            background: linear-gradient(135deg, #1976D2, #1565C0);
+            transform: translateY(-2px);
+        }
+        
+        /* Messages */
+        .message {
+            background: rgba(76, 175, 80, 0.1);
+            border-left: 4px solid var(--success-green);
+            color: var(--success-green);
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        
+        .error {
+            background: rgba(244, 67, 54, 0.1);
+            border-left: 4px solid var(--error-red);
+            color: var(--error-red);
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        
+        /* Info Section */
+        .info-section {
+            background: rgba(255, 204, 0, 0.05);
+            padding: 20px;
+            border-radius: var(--border-radius);
+            border: 1px solid rgba(255, 204, 0, 0.1);
+            margin-bottom: 30px;
+        }
+        
+        .info-section h2 {
+            color: var(--accent-gold);
+            margin: 0 0 15px 0;
+        }
+        
+        .info-section ul {
+            padding-left: 20px;
+            margin: 0;
+        }
+        
+        .info-section li {
+            margin-bottom: 10px;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+        
+        .info-section strong {
+            color: var(--accent-gold);
+        }
+        
+        /* Footer Actions */
+        .footer-actions {
+            text-align: center;
+            margin-top: 30px;
+        }
+        
+        .back-link {
+            display: inline-block;
+            padding: 12px 30px;
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--accent-gold);
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 600;
+            transition: var(--transition);
+            border: 1px solid rgba(255, 204, 0, 0.2);
+        }
+        
+        .back-link:hover {
+            background: rgba(255, 204, 0, 0.1);
+            transform: translateY(-2px);
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container {
+                padding: 15px;
+            }
+            
+            .status-dashboard {
+                grid-template-columns: 1fr;
+            }
+            
+            .control-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .btn {
+                padding: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>🤖 Auto-Player Control Panel</h1>
+            <p>Manage automated fake players to keep the platform active</p>
+        </div>
+        
+        <!-- Messages -->
+        {% if message %}
+        <div class="message">{{ message }}</div>
+        {% endif %}
+        
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        
+        <!-- Status Dashboard -->
+        <div class="status-dashboard">
+            <div class="status-card">
+                <h3>Auto-Player Status</h3>
+                <div class="status-value {% if status.enabled %}status-enabled{% else %}status-disabled{% endif %}">
+                    {% if status.enabled %}ACTIVE{% else %}INACTIVE{% endif %}
+                </div>
+                <p>System is currently {% if status.enabled %}running{% else %}stopped{% endif %}</p>
+            </div>
+            
+            <div class="status-card">
+                <h3>Fake Users Created</h3>
+                <div class="status-value status-count">{{ status.fake_users_count }}</div>
+                <p>Total fake users in system</p>
+            </div>
+            
+            <div class="status-card">
+                <h3>Active Fake Users</h3>
+                <div class="status-value status-count">{{ status.active_fake_users }}</div>
+                <p>Users with sufficient balance to play</p>
+            </div>
+            
+            <div class="status-card">
+                <h3>Play Interval</h3>
+                <div class="status-value">{{ status.play_interval }}s</div>
+                <p>Time between auto-play cycles</p>
+            </div>
+        </div>
+        
+        <!-- Control Panel -->
+        <div class="control-panel">
+            <h2>⚙️ Control Actions</h2>
+            
+            <div class="control-grid">
+                <!-- Create Fake Users -->
+                <div class="control-form">
+                    <h3>📝 Create Fake Users</h3>
+                    <p style="color: var(--text-muted); margin-bottom: 15px;">
+                        Create 50 fake users with Ksh. 5,000 initial balance each
+                    </p>
+                    <form method="POST" action="/admin/auto_player">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="action" value="create_users">
+                        <div class="form-group">
+                            <label for="count">Number of Users:</label>
+                            <input type="number" id="count" name="count" value="50" min="1" max="100">
+                        </div>
+                        <button type="submit" class="btn btn-primary">
+                            🚀 Create Fake Users
+                        </button>
+                    </form>
+                </div>
+                
+                <!-- Start/Stop Auto-Player -->
+                <div class="control-form">
+                    <h3>🎮 Auto-Player Controls</h3>
+                    <p style="color: var(--text-muted); margin-bottom: 15px;">
+                        Start or stop the automatic game playing system
+                    </p>
+                    <form method="POST" action="/admin/auto_player" style="display: inline-block; width: 100%;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        {% if status.enabled %}
+                        <input type="hidden" name="action" value="stop">
+                        <button type="submit" class="btn btn-danger">
+                            ⏸️ Stop Auto-Player
+                        </button>
+                        {% else %}
+                        <input type="hidden" name="action" value="start">
+                        <button type="submit" class="btn btn-primary">
+                            ▶️ Start Auto-Player
+                        </button>
+                        {% endif %}
+                    </form>
+                </div>
+                
+                <!-- Refill Balances -->
+                <div class="control-form">
+                    <h3>💰 Refill Balances</h3>
+                    <p style="color: var(--text-muted); margin-bottom: 15px;">
+                        Reset all fake user wallets to specified amount
+                    </p>
+                    <form method="POST" action="/admin/auto_player">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="action" value="refill_balances">
+                        <div class="form-group">
+                            <label for="amount">Balance Amount (Ksh.):</label>
+                            <input type="number" id="amount" name="amount" value="5000.00" step="0.01" min="100" max="100000">
+                        </div>
+                        <button type="submit" class="btn btn-info">
+                            💳 Refill All Wallets
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Information Section -->
+        <div class="info-section">
+            <h2>ℹ️ How It Works</h2>
+            <ul>
+                <li><strong>Fake Users:</strong> Created with Ksh. 5,000 initial balance each</li>
+                <li><strong>Auto-Playing:</strong> Fake users automatically join games every round</li>
+                <li><strong>Real Money:</strong> Fake users play with real money and can win/lose</li>
+                <li><strong>Continuous:</strong> System runs 24/7 until manually stopped</li>
+                <li><strong>Natural Behavior:</strong> Random delays and varied participation rates</li>
+                <li><strong>Admin Control:</strong> Full control to start/stop anytime</li>
+                <li><strong>No Registration Bypass:</strong> Fake users are created legitimately in the system</li>
+            </ul>
+        </div>
+        
+        <!-- Footer Actions -->
+        <div class="footer-actions">
+            <a href="/admin/dashboard" class="back-link">
+                ← Back to Admin Dashboard
+            </a>
+        </div>
+    </div>
+    
+    <!-- Auto-refresh status every 10 seconds when active -->
+    {% if status.enabled %}
+    <script>
+        setTimeout(function() {
+            location.reload();
+        }, 10000);
+    </script>
+    {% endif %}
+</body>
+</html>
+"""
+
+# ============================
+# ADD TO ADMIN DASHBOARD
+# ============================
+
+# Add this button to your admin_dashboard function in the action grid:
+"""
+<div class="control-form">
+    <h3>🤖 Auto-Player</h3>
+    <p>Manage automated fake players</p>
+    <a href="/admin/auto_player" class="btn" style="background: #9C27B0; color: white; text-decoration: none; display: block; text-align: center; padding: 10px;">
+        🤖 Auto-Player Control
+    </a>
+</div>
+"""
+
+# ============================
+# MODIFY GAME LOGIC TO INCLUDE FAKE USERS
+# ============================
+
+# In your existing game logic (process_game_round function), fake users will automatically
+# be included because they're regular users in the database. No modification needed!
+
+# ============================
+# INITIALIZATION ON APP START
+# ============================
+
+@app.before_request
+def initialize_auto_player():
+    """Initialize auto-player on app start"""
+    if not hasattr(app, 'auto_player_initialized'):
+        # Load settings from database
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT enabled FROM auto_player_settings")
+            result = cursor.fetchone()
+            if result and result[0]:
+                auto_player_status['enabled'] = True
+                start_auto_player()
+        
+        cursor.execute("SELECT COUNT(*) FROM fake_users")
+        count_result = cursor.fetchone()
+        auto_player_status['fake_users_count'] = count_result[0] if count_result else 0
+        auto_player_status['fake_users_created'] = auto_player_status['fake_users_count'] > 0
+        
+        app.auto_player_initialized = True
+        logging.info(f"Auto-player initialized. Fake users: {auto_player_status['fake_users_count']}")
+
+# ============================
+# ADDITIONAL HELPER FUNCTIONS
+# ============================
+
+def get_fake_user_stats():
+    """Get detailed statistics about fake users"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Total fake users
+            cursor.execute("SELECT COUNT(*) FROM fake_users")
+            total = cursor.fetchone()[0]
+            
+            # Active fake users (balance >= 1)
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM fake_users f 
+                JOIN users u ON f.username = u.username 
+                WHERE u.wallet >= 1.00
+            """)
+            active = cursor.fetchone()[0]
+            
+            # Total balance of all fake users
+            cursor.execute("""
+                SELECT COALESCE(SUM(u.wallet), 0) 
+                FROM fake_users f 
+                JOIN users u ON f.username = u.username
+            """)
+            total_balance = cursor.fetchone()[0]
+            
+            # Fake users in current game queue
+            cursor.execute("""
+                SELECT COUNT(DISTINCT gq.user_id) 
+                FROM game_queue gq 
+                JOIN users u ON gq.user_id = u.id 
+                JOIN fake_users f ON u.username = f.username
+            """)
+            in_queue = cursor.fetchone()[0]
+            
+            return {
+                'total_fake_users': total,
+                'active_fake_users': active,
+                'total_fake_balance': float(total_balance),
+                'fake_users_in_queue': in_queue,
+                'average_balance': float(total_balance / total if total > 0 else 0)
+            }
+    except Exception as e:
+        logging.error(f"Error getting fake user stats: {e}")
+        return {}
+
+# Add this route for detailed stats if needed
+@app.route("/admin/auto_player/stats")
+@login_required(role='admin')
+def auto_player_stats():
+    """Get auto-player statistics (JSON API)"""
+    stats = get_fake_user_stats()
+    status = get_auto_player_status()
+    return jsonify({
+        'auto_player': status,
+        'fake_users': stats
+    })
+
 # --- Background game loop start ---
 game_thread_started = False
 
@@ -5575,3 +6520,6 @@ def start_background_game_loop():
 # --- Run ---
 if __name__ == "__main__":
     app.run(debug=True, host="127.0.0.1", port=5000)     
+    
+    
+    

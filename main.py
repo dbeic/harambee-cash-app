@@ -5593,7 +5593,8 @@ admin_dashboard = """
         });
     </script>
 </body>
-</html>"""
+</html>
+"""
 
 TERMS_CONTENT = """
 <!DOCTYPE html>

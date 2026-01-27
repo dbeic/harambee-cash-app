@@ -5045,15 +5045,7 @@ admin_html = """
             <label for="allowed_username">Username:</label>
             <input type="text" id="allowed_username" name="allowed_username" required>
             <button type="submit">Add Allowed User</button>
-        </form>
-        
-<div class="control-form">
-    <h3>🤖 Auto-Player</h3>
-    <p>Manage automated fake players</p>
-    <a href="/admin/auto_player" class="btn" style="background: #9C27B0; color: white; text-decoration: none; display: block; text-align: center; padding: 10px;">
-        🤖 Auto-Player Control
-    </a>
-</div>        
+        </form>      
 
         <button class="monitor-btn" onclick="window.location.href='/admin/visitor_log'">View Visitor Log</button>
         <button class="cashbook-btn" onclick="window.location.href='/cashbook'">ðŸ’° View Gross Profit Dashboard</button>
@@ -5309,6 +5301,12 @@ admin_dashboard = """
         .action-btn.deposits:hover {
             background-color: #F57C00;
         }
+        .action-btn.auto-player {
+            background-color: #9C27B0;
+        }
+        .action-btn.auto-player:hover {
+            background-color: #7B1FA2;
+        }
         
         /* Messages */
         .error {
@@ -5389,6 +5387,9 @@ admin_dashboard = """
             </a>
             <a href="/admin/deposits" class="action-btn deposits">
                 💵 Deposits
+            </a>
+            <a href="/admin/auto_player" class="action-btn auto-player">
+                🤖 Auto-Player
             </a>
         </div>
         
@@ -5592,8 +5593,7 @@ admin_dashboard = """
         });
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 TERMS_CONTENT = """
 <!DOCTYPE html>
@@ -6517,7 +6517,4 @@ def start_background_game_loop():
         
 # --- Run ---
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)     
-    
-    
-    
+    app.run(debug=True, host="127.0.0.1", port=5000)

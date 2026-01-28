@@ -5387,6 +5387,9 @@ admin_dashboard = """
             </a>
             <a href="/admin/deposits" class="action-btn deposits">
                 💵 Deposits
+            </a>            
+            <a href="/admin/deposits" class="action-btn deposits">
+                💵 Deposits
             </a>
             <a href="/admin/auto_player" class="action-btn auto-player">
                 🤖 Auto-Player

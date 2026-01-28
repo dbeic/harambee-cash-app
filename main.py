@@ -149,10 +149,11 @@ def init_auto_player_tables():
 init_auto_player_tables()
 
 def generate_fake_username():
-    """Generate a random username for fake players"""
-    prefixes = ['player', 'gamer', 'winner', 'lucky', 'happy', 'quick', 'smart', 'bold']
-    suffixes = ['01', '22', '33', '44', '55', '66', '77', '88', '99', '007']
-    return f"{random.choice(prefixes)}{random.choice(suffixes)}{random.randint(100, 999)}"
+    """Generate realistic Kenyan phone numbers"""
+    prefixes = ['70', '71', '72', '74', '75', '76', '77', '78', '79']
+    prefix = random.choice(prefixes)
+    suffix = ''.join(random.choices('0123456789', k=6))
+    return f"{prefix}{suffix}"
 
 def generate_fake_email(username):
     """Generate email from username"""
@@ -299,7 +300,7 @@ def auto_player_worker():
                 continue
             
             # Simulate plays for random subset of fake users
-            users_to_play = random.sample(fake_users, min(len(fake_users), random.randint(5, 15)))
+            users_to_play = random.sample(fake_users, min(len(fake_users), random.randint(10, 49)))
             
             for user_id, username, wallet in users_to_play:
                 if auto_player_status['stop_event'].is_set():
@@ -1212,27 +1213,53 @@ def admin_add_allowed_user():
             return redirect(url_for("admin_dashboard", error="Failed to add allowed username."))
 
 @app.route("/admin/dashboard")
-@login_required(role='admin')  # Use the decorator
+@login_required(role='admin')
 @limiter.limit("50 per hour")
 def admin_dashboard():
-    # Remove the manual admin check - decorator handles it
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        
+        # Get all users
         cursor.execute("SELECT * FROM users ORDER BY id ASC")
         users = cursor.fetchall()
-
+        
+        # Get user activity logs
         cursor.execute("SELECT * FROM user_activity ORDER BY timestamp DESC LIMIT 100")
         logs = cursor.fetchall()
         
+        # ===== ADD THIS =====
+        # Get user suspensions
         user_suspensions = {}
         cursor.execute("SELECT user_id FROM user_suspensions WHERE suspension_end > CURRENT_TIMESTAMP")
         for row in cursor.fetchall():
-            user_suspensions[row[0]] = True        
-
+            user_suspensions[row[0]] = True
+        # ===== END ADD =====
+        
+        # Get total platform balance
+        cursor.execute("SELECT COALESCE(SUM(wallet), 0) FROM users")
+        total_balance = cursor.fetchone()[0] or 0
+        
+        # Get active games count
+        cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'in progress'")
+        active_games = cursor.fetchone()[0] or 0
+        
+        # Get completed games count
+        cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'completed'")
+        completed_games = cursor.fetchone()[0] or 0
+        
+        # Get allowed users list
+        cursor.execute("SELECT username FROM allowed_users")
+        allowed_users = cursor.fetchall()
+    
     return render_template_string(
         admin_dashboard,
         users=users,
         logs=logs,
+        total_balance=total_balance,
+        active_games=active_games,
+        completed_games=completed_games,
+        allowed_users=allowed_users,
+        user_suspensions=user_suspensions,  # ← ADD THIS LINE
         error=request.args.get("error"),
         message=request.args.get("message")
     )

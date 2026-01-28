@@ -389,7 +389,12 @@ def get_auto_player_status():
         }
     except Exception as e:
         logging.error(f"Error getting auto-player status: {e}")
-        return {}                
+        return {}
+        
+user_suspensions = {}
+cursor.execute("SELECT user_id FROM user_suspensions WHERE suspension_end > CURRENT_TIMESTAMP")
+for row in cursor.fetchall():
+    user_suspensions[row[0]] = True                                  
 
 # --- Database initialization ---
 def init_db():
@@ -541,7 +546,7 @@ def init_db():
                 is_active BOOLEAN DEFAULT TRUE
             )
         """)        
-        # Win earnings (tracks usersâ€™ winnings from games)
+        # Win earnings (tracks usersÃ¢â‚¬â„¢ winnings from games)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS win_earnings (
                 id SERIAL PRIMARY KEY,
@@ -825,7 +830,7 @@ def register():
                 logging.error(f"Database error during registration: {e}")
                 return render_template_string(register_html, error="Something went wrong. Try again later.")
 
-    # GET request â€” show registration form
+    # GET request Ã¢â‚¬â€ show registration form
     return render_template_string(register_html)
     
 # ============================
@@ -1176,7 +1181,7 @@ def play():
 
             return jsonify({
                 "success": True, 
-                "message": "🎉 Successfully enrolled in the next game!",
+                "message": "ðŸŽ‰ Successfully enrolled in the next game!",
                 "new_balance": new_balance
             })
 
@@ -1264,7 +1269,7 @@ def view_visits():
         {% endfor %}
     </table>
     <br>
-    <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
+    <a href="/admin/dashboard">Ã¢â€  Back to Admin Dashboard</a>
     """, logs=logs)
     
 @app.route("/logout")
@@ -1896,7 +1901,20 @@ def game_status():
     # Replace this with your actual game logic
     game_just_won = False  
 
-    return jsonify({'status': 'success' if game_just_won else 'pending'})          
+    return jsonify({'status': 'success' if game_just_won else 'pending'})
+    
+# In your /admin/dashboard route, add these calculations:
+cursor.execute("SELECT SUM(wallet) FROM users")
+total_balance = cursor.fetchone()[0] or 0
+
+cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'in progress'")
+active_games = cursor.fetchone()[0]
+
+cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'completed'")
+completed_games = cursor.fetchone()[0]
+
+cursor.execute("SELECT username FROM allowed_users")
+allowed_users = cursor.fetchall()                        
                   
         
 #NON MONETARY ADMIN FUNCTIONS
@@ -2023,7 +2041,7 @@ admin_withdrawals_html = """
         </table>
         
         <div class="back-link">
-            <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
+            <a href="/admin/dashboard">Ã¢â€  Back to Admin Dashboard</a>
         </div>
     </div>
 
@@ -2186,7 +2204,7 @@ withdraw_html = """
 </head>
 <body>
     <div class="container">
-        <h1>ðŸ’° Withdraw Earnings</h1>
+        <h1>Ã°Å¸â€™Â° Withdraw Earnings</h1>
         
         {% if error %}
         <div class="error">{{ error }}</div>
@@ -2199,11 +2217,11 @@ withdraw_html = """
         
         {% if can_withdraw %}
         <div class="fee-info">
-            <strong>ðŸ’° Withdrawal Fees:</strong><br>
-            â€¢ KES 100-1,000: KES 10 fee<br>
-            â€¢ KES 1,001-5,000: KES 25 fee<br>
-            â€¢ KES 5,001-20,000: KES 50 fee<br>
-            â€¢ KES 20,001-50,000: KES 100 fee
+            <strong>Ã°Å¸â€™Â° Withdrawal Fees:</strong><br>
+            Ã¢â‚¬Â¢ KES 100-1,000: KES 10 fee<br>
+            Ã¢â‚¬Â¢ KES 1,001-5,000: KES 25 fee<br>
+            Ã¢â‚¬Â¢ KES 5,001-20,000: KES 50 fee<br>
+            Ã¢â‚¬Â¢ KES 20,001-50,000: KES 100 fee
         </div>
         
         <form method="POST" action="/withdraw">
@@ -2235,19 +2253,19 @@ withdraw_html = """
         {% endif %}
         
         <div class="rules">
-            <h3>ðŸ“‹ Withdrawal Rules</h3>
+            <h3>Ã°Å¸â€œâ€¹ Withdrawal Rules</h3>
             <ul>
-                <li>âœ… Minimum withdrawal: KES 100</li>
-                <li>âœ… Funds must be from game winnings only</li>
-                <li>âœ… One withdrawal every 24 hours</li>
-                <li>âœ… Withdrawal fees apply as shown above</li>
-                <li>âŒ Excessive attempts = 6 hour suspension</li>
-                <li>âœ… Processed within 24 hours by admin</li>
+                <li>Ã¢Å“â€¦ Minimum withdrawal: KES 100</li>
+                <li>Ã¢Å“â€¦ Funds must be from game winnings only</li>
+                <li>Ã¢Å“â€¦ One withdrawal every 24 hours</li>
+                <li>Ã¢Å“â€¦ Withdrawal fees apply as shown above</li>
+                <li>Ã¢Å’ Excessive attempts = 6 hour suspension</li>
+                <li>Ã¢Å“â€¦ Processed within 24 hours by admin</li>
             </ul>
         </div>
         
         <div class="back-link">
-            <a href="/">â† Back to Home</a>
+            <a href="/">Ã¢â€  Back to Home</a>
         </div>
     </div>
 </body>
@@ -2375,7 +2393,7 @@ admin_deposit_html = """
         </table>
         
         <div class="back-link">
-            <a href="/admin/dashboard">← Back to Admin Dashboard</a>
+            <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
         </div>
     </div>
 
@@ -2582,15 +2600,15 @@ withdrawal_receipt_html = """
         </div>
         
         <div class="instructions">
-            <strong>📋 FOR ADMIN PROCESSING:</strong><br>
+            <strong>ðŸ“‹ FOR ADMIN PROCESSING:</strong><br>
             "Kindly send KES {{ "%.2f"|format(withdrawal[5]) }} to the user via platform M-Pesa number as per system approval."
             <br><br>
-            <strong>ℹ️ VERIFICATION:</strong> Use independent M-Pesa records for transaction confirmation.
+            <strong>â„¹ï¸ VERIFICATION:</strong> Use independent M-Pesa records for transaction confirmation.
         </div>
         
         <div class="action-buttons">
-            <button class="btn btn-print" onclick="window.print()">🖨️ Print</button>
-            <a href="/" class="btn btn-home">🏠 Home</a>
+            <button class="btn btn-print" onclick="window.print()">ðŸ–¨ï¸ Print</button>
+            <a href="/" class="btn btn-home">ðŸ  Home</a>
         </div>
     </div>
 </body>
@@ -2752,15 +2770,15 @@ deposit_voucher_html = """
         </div>
         
         <div class="instructions">
-            <strong>📋 PRESENT TO ADMIN:</strong><br>
+            <strong>ðŸ“‹ PRESENT TO ADMIN:</strong><br>
             "Kindly update my platform wallet account with the M-Pesa amount sent to your platform recently!"
             <br><br>
-            <strong>ℹ️ NOTE:</strong> No M-Pesa confirmation message needed. Platform has official M-Pesa number for verification.
+            <strong>â„¹ï¸ NOTE:</strong> No M-Pesa confirmation message needed. Platform has official M-Pesa number for verification.
         </div>
         
         <div class="action-buttons">
-            <button class="btn btn-print" onclick="window.print()">🖨️ Print</button>
-            <a href="/" class="btn btn-home">🏠 Home</a>
+            <button class="btn btn-print" onclick="window.print()">ðŸ–¨ï¸ Print</button>
+            <a href="/" class="btn btn-home">ðŸ  Home</a>
         </div>
     </div>
 </body>
@@ -2889,14 +2907,14 @@ deposit_html = """
 </head>
 <body>
     <div class="container">
-        <h1>💰 Deposit Funds</h1>
+        <h1>ðŸ’° Deposit Funds</h1>
         
         {% if error %}
         <div class="error">{{ error }}</div>
         {% endif %}
         
         <div class="info-box">
-            <strong>📱 Payment Instructions:</strong><br>
+            <strong>ðŸ“± Payment Instructions:</strong><br>
             1. Send money via M-Pesa to our official number<br>
             2. Generate deposit voucher below<br>
             3. Present voucher to admin for verification<br>
@@ -2921,19 +2939,19 @@ deposit_html = """
         {% endif %}
         
         <div class="rules">
-            <h3>📋 Deposit Rules</h3>
+            <h3>ðŸ“‹ Deposit Rules</h3>
             <ul>
-                <li>✅ Minimum deposit: KES 50</li>
-                <li>✅ Maximum deposit: KES 50,000</li>
-                <li>✅ Use official M-Pesa number only</li>
-                <li>✅ Keep transaction details safe</li>
-                <li>✅ Processing time: Within 2 hours</li>
-                <li>❌ No fake deposits tolerated</li>
+                <li>âœ… Minimum deposit: KES 50</li>
+                <li>âœ… Maximum deposit: KES 50,000</li>
+                <li>âœ… Use official M-Pesa number only</li>
+                <li>âœ… Keep transaction details safe</li>
+                <li>âœ… Processing time: Within 2 hours</li>
+                <li>âŒ No fake deposits tolerated</li>
             </ul>
         </div>
         
         <div class="back-link">
-            <a href="/">← Back to Home</a>
+            <a href="/">â† Back to Home</a>
         </div>
     </div>
 </body>
@@ -3235,7 +3253,7 @@ cashbook_html = """
     <div class="container">
         <!-- Header -->
         <div class="header">
-            <h1>💰 Financial Dashboard</h1>
+            <h1>ðŸ’° Financial Dashboard</h1>
             <div class="last-updated">
                 Last updated: <span id="currentTime"></span>
             </div>
@@ -3264,7 +3282,7 @@ cashbook_html = """
         
         <!-- Key Metrics -->
         <div class="key-metrics">
-            <h2>📊 Key Financial Metrics</h2>
+            <h2>ðŸ“Š Key Financial Metrics</h2>
             <div class="metrics-grid">
                 <div class="metric-item">
                     <span class="metric-label">Total Profitable Games</span>
@@ -3295,7 +3313,7 @@ cashbook_html = """
         
         <!-- Recent Transactions -->
         <div class="recent-transactions">
-            <h2>📋 Recent Profit Transactions</h2>
+            <h2>ðŸ“‹ Recent Profit Transactions</h2>
             {% if data.recent_profits %}
             <table class="transactions-table">
                 <thead>
@@ -3334,7 +3352,7 @@ cashbook_html = """
         
         <!-- Financial Health Notice -->
         <div class="financial-health">
-            <h2>💡 Financial Health Notice</h2>
+            <h2>ðŸ’¡ Financial Health Notice</h2>
             <div class="health-message">
                 <strong>Important:</strong> User funds totaling <strong>Ksh. {{ "%.2f"|format(data.total_user_balance) }}</strong> represent liabilities that must remain available for withdrawals. 
                 The net position of <strong>Ksh. {{ "%.2f"|format(data.total_gross_profit - data.total_user_balance) }}</strong> indicates the platform's available capital after accounting for user liabilities.
@@ -3344,7 +3362,7 @@ cashbook_html = """
         <!-- Footer Actions -->
         <div class="footer-actions">
             <a href="/admin/dashboard" class="back-btn">
-                ← Back to Admin Dashboard
+                â† Back to Admin Dashboard
             </a>
         </div>
     </div>
@@ -3701,11 +3719,11 @@ base_html = """
                 {% if session.get('user_id') %}
                     <div class="wallet-badge">Ksh. {{ wallet_balance | default(0.0) | float | round(2) }}</div>
                     <!-- PWA Install Button -->
-                    <button id="install-btn" class="cta-button" style="display:none;">📱 Install App</button>
+                    <button id="install-btn" class="cta-button" style="display:none;">ðŸ“± Install App</button>
                     <!-- Play form -->                    
                     <form method="POST" action="{{ url_for('play') }}" id="playForm" style="text-align:center; margin-bottom:16px;">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-                        <button type="submit" id="playButton" class="cta-button">🎮 PLAY NOW & WIN BIG!</button>
+                        <button type="submit" id="playButton" class="cta-button">ðŸŽ® PLAY NOW & WIN BIG!</button>
                     </form>                                         
                 {% endif %}
             </div>
@@ -3715,14 +3733,14 @@ base_html = """
     <!-- Navigation -->
     <nav>
         {% if not session.get('user_id') %}
-            <a href="{{ url_for('register') }}">📝 Register</a>
-            <a href="{{ url_for('login') }}">🔑 Login</a>
+            <a href="{{ url_for('register') }}">ðŸ“ Register</a>
+            <a href="{{ url_for('login') }}">ðŸ”‘ Login</a>
         {% else %}
-            <a href="{{ url_for('deposit') }}">💳 Deposit</a>
-            <a href="{{ url_for('withdraw') }}">📤 Withdraw</a>
-            <a href="{{ url_for('logout') }}">🚪 Logout</a>
+            <a href="{{ url_for('deposit') }}">ðŸ’³ Deposit</a>
+            <a href="{{ url_for('withdraw') }}">ðŸ“¤ Withdraw</a>
+            <a href="{{ url_for('logout') }}">ðŸšª Logout</a>
             {% if session.get('is_admin') %}
-                <a href="{{ url_for('admin_dashboard') }}">🛠 Admin</a>
+                <a href="{{ url_for('admin_dashboard') }}">ðŸ›  Admin</a>
             {% endif %}
         {% endif %}
     </nav>
@@ -3760,22 +3778,22 @@ base_html = """
             </div>
             <div class="features-grid" style="margin-top:20px;">
                 <div class="feature-card">
-                    <div style="font-size:1.6rem;">💰</div>
+                    <div style="font-size:1.6rem;">ðŸ’°</div>
                     <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Win Real Cash</div>
                     <div style="color:var(--text-muted); margin-top:6px;">Play with just Ksh. 1.00 and win exciting cash prizes</div>
                 </div>
                 <div class="feature-card">
-                    <div style="font-size:1.6rem;">⚡</div>
+                    <div style="font-size:1.6rem;">âš¡</div>
                     <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Fast Games</div>
                     <div style="color:var(--text-muted); margin-top:6px;">New games every 30 seconds with instant results</div>
                 </div>
                 <div class="feature-card">
-                    <div style="font-size:1.6rem;">🛡️</div>
+                    <div style="font-size:1.6rem;">ðŸ›¡ï¸</div>
                     <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Secure & Safe</div>
                     <div style="color:var(--text-muted); margin-top:6px;">Advanced security with fair gameplay guaranteed</div>
                 </div>
                 <div class="feature-card">
-                    <div style="font-size:1.6rem;">🏆</div>
+                    <div style="font-size:1.6rem;">ðŸ†</div>
                     <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Community</div>
                     <div style="color:var(--text-muted); margin-top:6px;">Join thousands of players winning together</div>
                 </div>
@@ -3783,7 +3801,7 @@ base_html = """
         {% else %}
             <!-- Logged-in UI -->
             <div style="text-align:center; margin-bottom:14px;">
-                <p style="font-size:1.1rem; color:var(--text-gold); font-weight:700;">Welcome back, {{ session.get('username') }}! 👋</p>
+                <p style="font-size:1.1rem; color:var(--text-gold); font-weight:700;">Welcome back, {{ session.get('username') }}! ðŸ‘‹</p>
             </div>
 
             <!-- Game status & recent results -->
@@ -3800,19 +3818,19 @@ base_html = """
 
         <!-- Offline Content (hidden/shown via JS) -->
         <div id="offlineBanner" class="offline-banner" style="display:none;">
-            <h3>📶 You're Offline - But the Fun Continues!</h3>
+            <h3>ðŸ“¶ You're Offline - But the Fun Continues!</h3>
             <p>Try these activities while you reconnect:</p>
         </div>
 
         <div id="offlineEntertainment" style="display:none;">
             <div class="game-window">
-                <h2>🎮 {% if session.get('user_id') %}Offline Training Zone{% else %}Offline Fun Zone{% endif %}</h2>
+                <h2>ðŸŽ® {% if session.get('user_id') %}Offline Training Zone{% else %}Offline Fun Zone{% endif %}</h2>
                 <div class="offline-options" style="display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:12px;">
-                    <button class="offline-btn" onclick="startTriviaGame()">🧠 {% if session.get('user_id') %}Harambee Trivia{% else %}Trivia Challenge{% endif %}</button>
-                    <button class="offline-btn" onclick="showGamingTips()">📚 {% if session.get('user_id') %}Winning Strategies{% else %}Gaming Tips{% endif %}</button>
-                    <button class="offline-btn" onclick="showPracticeMode()">💪 {% if session.get('user_id') %}Practice Games{% else %}Practice Strategies{% endif %}</button>
+                    <button class="offline-btn" onclick="startTriviaGame()">ðŸ§  {% if session.get('user_id') %}Harambee Trivia{% else %}Trivia Challenge{% endif %}</button>
+                    <button class="offline-btn" onclick="showGamingTips()">ðŸ“š {% if session.get('user_id') %}Winning Strategies{% else %}Gaming Tips{% endif %}</button>
+                    <button class="offline-btn" onclick="showPracticeMode()">ðŸ’ª {% if session.get('user_id') %}Practice Games{% else %}Practice Strategies{% endif %}</button>
                     {% if session.get('user_id') %}
-                    <button class="offline-btn" onclick="viewAchievements()">🏆 My Achievements</button>
+                    <button class="offline-btn" onclick="viewAchievements()">ðŸ† My Achievements</button>
                     {% endif %}
                 </div>
                 <div id="offlineContent" style="margin-top:14px;"></div>
@@ -3840,7 +3858,7 @@ base_html = """
             </a>
         </div>
 
-        <p style="margin-top:16px; color:var(--text-muted);">© 2025 Pigasimu. All rights reserved.</p>
+        <p style="margin-top:16px; color:var(--text-muted);">Â© 2025 Pigasimu. All rights reserved.</p>
     </div>
 
     <!-- Game Animation Overlay -->
@@ -3875,7 +3893,7 @@ base_html = """
                 try {
                     this.isSubmitting = true;
                     button.disabled = true;
-                    button.innerHTML = '🚀 LAUNCHING...';
+                    button.innerHTML = 'ðŸš€ LAUNCHING...';
             
                     this.showLaunchAnimation();
             
@@ -3926,7 +3944,7 @@ base_html = """
 
             showLaunchAnimation() {
                 const rocket = document.createElement('div');
-                rocket.innerHTML = '🚀';
+                rocket.innerHTML = 'ðŸš€';
                 rocket.style.cssText = `
                     position: fixed;
                     bottom: 20px;
@@ -3962,9 +3980,9 @@ base_html = """
                         box-shadow: 0 0 50px rgba(255, 215, 0, 0.8);
                         animation: popIn 0.5s ease-out;
                     ">
-                        <div style="font-size: 3rem; margin-bottom: 10px;">🎉</div>
+                        <div style="font-size: 3rem; margin-bottom: 10px;">ðŸŽ‰</div>
                         ENROLLED SUCCESSFULLY!
-                        <div style="font-size: 1rem; margin-top: 10px;">Get ready to win big! 🚀</div>
+                        <div style="font-size: 1rem; margin-top: 10px;">Get ready to win big! ðŸš€</div>
                     </div>
                 `;
         
@@ -3981,7 +3999,7 @@ base_html = """
                 for (let i = 0; i < 50; i++) {
                     setTimeout(() => {
                         const confetti = document.createElement('div');
-                        confetti.innerHTML = ['🎉', '🎊', '⭐', '💫', '✨'][Math.floor(Math.random() * 5)];
+                        confetti.innerHTML = ['ðŸŽ‰', 'ðŸŽŠ', 'â­', 'ðŸ’«', 'âœ¨'][Math.floor(Math.random() * 5)];
                         confetti.style.cssText = `
                             position: fixed;
                             top: 100%;
@@ -4084,7 +4102,7 @@ base_html = """
             updateQueueStatus() {
                 const button = document.getElementById('playButton');
                 if (button) {
-                    button.innerHTML = '✅ ENROLLED!';
+                    button.innerHTML = 'âœ… ENROLLED!';
                     button.disabled = true;
                     button.style.background = 'linear-gradient(135deg, #00C9B1, #00A896)';
                 }
@@ -4129,7 +4147,7 @@ base_html = """
 
         document.addEventListener('DOMContentLoaded', function() {
             new UltimatePlayExperience();
-            console.log('🎮 Ultimate Play Experience Activated!');
+            console.log('ðŸŽ® Ultimate Play Experience Activated!');
         });
     </script>
 
@@ -4157,7 +4175,7 @@ base_html = """
                 return; 
             }
             const q = triviaQuestions[currentTriviaQuestion];
-            let html = `<h3>🧠 Question ${currentTriviaQuestion + 1}/${triviaQuestions.length}</h3>
+            let html = `<h3>ðŸ§  Question ${currentTriviaQuestion + 1}/${triviaQuestions.length}</h3>
                         <p style="font-size:1.1rem; margin:12px 0;">${q.question}</p>
                         <div id="triviaOptions">`;
             q.options.forEach((opt, idx) => {
@@ -4210,15 +4228,15 @@ base_html = """
         function endTriviaGame() {
             let msg = '';
             if (triviaScore === triviaQuestions.length) { 
-                msg = "🎉 Perfect! You're a Harambee Cash expert!"; 
+                msg = "ðŸŽ‰ Perfect! You're a Harambee Cash expert!"; 
                 unlockAchievement('trivia_master'); 
             } else if (triviaScore >= triviaQuestions.length / 2) { 
-                msg = "👍 Great job! You know your stuff!"; 
+                msg = "ðŸ‘ Great job! You know your stuff!"; 
             } else { 
-                msg = "💪 Keep learning! Read the tips to improve!"; 
+                msg = "ðŸ’ª Keep learning! Read the tips to improve!"; 
             }
             const out = document.getElementById('offlineContent');
-            if (out) out.innerHTML = `<div style="text-align:center; padding:20px;"><h3>🏆 Trivia Complete!</h3><p>Final Score: ${triviaScore}/${triviaQuestions.length}</p><p>${msg}</p><button class="offline-btn" onclick="startTriviaGame()">Play Again</button></div>`;
+            if (out) out.innerHTML = `<div style="text-align:center; padding:20px;"><h3>ðŸ† Trivia Complete!</h3><p>Final Score: ${triviaScore}/${triviaQuestions.length}</p><p>${msg}</p><button class="offline-btn" onclick="startTriviaGame()">Play Again</button></div>`;
         }
     </script>
 
@@ -4226,16 +4244,16 @@ base_html = """
     <script>
         function showGamingTips() {
             const tips = [
-                "💰 Set a budget before you start playing and stick to it",
-                "⏰ Take regular breaks - don't play for more than 1 hour continuously",
-                "🎯 Understand the game rules completely before playing",
-                "💡 Never chase losses - if you're losing, take a break",
-                "📊 Keep track of your wins and losses",
-                "🎮 Remember: Gaming should be fun, not a source of income",
-                "🔄 Try different strategies in practice mode first",
-                "📱 Install the app for better experience and notifications"
+                "ðŸ’° Set a budget before you start playing and stick to it",
+                "â° Take regular breaks - don't play for more than 1 hour continuously",
+                "ðŸŽ¯ Understand the game rules completely before playing",
+                "ðŸ’¡ Never chase losses - if you're losing, take a break",
+                "ðŸ“Š Keep track of your wins and losses",
+                "ðŸŽ® Remember: Gaming should be fun, not a source of income",
+                "ðŸ”„ Try different strategies in practice mode first",
+                "ðŸ“± Install the app for better experience and notifications"
             ];
-            let html = '<h3>📚 Smart Gaming Tips</h3><ul style="text-align:left; margin-top:10px;">';
+            let html = '<h3>ðŸ“š Smart Gaming Tips</h3><ul style="text-align:left; margin-top:10px;">';
             tips.forEach(t => { 
                 html += `<li style="margin:8px 0; padding:8px; background:rgba(0,201,177,0.06); border-radius:8px;">${t}</li>`; 
             });
@@ -4247,7 +4265,7 @@ base_html = """
 
         function showPracticeMode() {
             const html = `<div style="text-align:center;">
-                <h3>💪 Practice Strategies</h3>
+                <h3>ðŸ’ª Practice Strategies</h3>
                 <div style="text-align:left; margin-top:12px;">
                     <div class="game-result"><h4>Scenario 1: Winning Streak</h4><p>You've won 3 games in a row. What should you do?</p><p><em>Answer: Consider taking a break or setting aside some winnings.</em></p></div>
                     <div class="game-result"><h4>Scenario 2: Losing Streak</h4><p>You've lost 5 consecutive games. Your next move?</p><p><em>Answer: Take a break, don't chase losses. Come back fresh later.</em></p></div>
@@ -4282,7 +4300,7 @@ base_html = """
         function showAchievementNotification(name) {
             const n = document.createElement('div');
             n.className = 'achievement-notification';
-            n.innerHTML = `<div style="text-align:center;"><div style="font-size:1.4rem;">🏆</div><h4 style="margin:6px 0;">Achievement Unlocked!</h4><div>${name}</div></div>`;
+            n.innerHTML = `<div style="text-align:center;"><div style="font-size:1.4rem;">ðŸ†</div><h4 style="margin:6px 0;">Achievement Unlocked!</h4><div>${name}</div></div>`;
             document.body.appendChild(n);
             setTimeout(() => { 
                 n.style.opacity = '0'; 
@@ -4293,11 +4311,11 @@ base_html = """
         }
 
         function viewAchievements() {
-            let html = '<h3>🏆 My Achievements</h3><div style="text-align:left;">';
+            let html = '<h3>ðŸ† My Achievements</h3><div style="text-align:left;">';
             Object.keys(achievements).forEach(k => {
                 const a = achievements[k];
                 html += `<div style="padding:12px; margin:8px 0; background:${a.unlocked ? 'rgba(0,201,177,0.12)' : 'rgba(0,0,0,0.12)'}; border-radius:10px;">
-                    <strong>${a.unlocked ? '✅' : '🔒'} ${a.name}</strong>
+                    <strong>${a.unlocked ? 'âœ…' : 'ðŸ”’'} ${a.name}</strong>
                     <p style="margin:6px 0 0 0; font-size:0.9rem;">${a.description}</p>
                 </div>`;
             });
@@ -4400,13 +4418,13 @@ base_html = """
                         data.completed_games.forEach(game => {
                             html += `
                                 <div class="game-result">
-                                    <p><strong>🎯 Game Code:</strong> ${game.game_code}</p>
-                                    <p><strong>🕒 Timestamp:</strong> ${game.timestamp}</p>
-                                    <p><strong>👥 Players:</strong> ${game.num_users}</p>
-                                    <p><strong>💰 Total Amount:</strong> ${game.total_amount}</p>
-                                    <p><strong>🏆 Winner:</strong> ${game.winner}</p>
-                                    <p><strong>🎁 Win Amount:</strong> ${game.winner_amount}</p>
-                                    <p><strong>📊 Outcome:</strong> ${game.outcome_message}</p>
+                                    <p><strong>ðŸŽ¯ Game Code:</strong> ${game.game_code}</p>
+                                    <p><strong>ðŸ•’ Timestamp:</strong> ${game.timestamp}</p>
+                                    <p><strong>ðŸ‘¥ Players:</strong> ${game.num_users}</p>
+                                    <p><strong>ðŸ’° Total Amount:</strong> ${game.total_amount}</p>
+                                    <p><strong>ðŸ† Winner:</strong> ${game.winner}</p>
+                                    <p><strong>ðŸŽ Win Amount:</strong> ${game.winner_amount}</p>
+                                    <p><strong>ðŸ“Š Outcome:</strong> ${game.outcome_message}</p>
                                 </div>
                             `;
                         });
@@ -4419,11 +4437,11 @@ base_html = """
                 const playButton = document.getElementById('playButton');
                 if (playButton) {
                     if (data.current_user_queued) {
-                        playButton.innerHTML = '✅ ENROLLED!';
+                        playButton.innerHTML = 'âœ… ENROLLED!';
                         playButton.disabled = true;
                         playButton.style.background = 'linear-gradient(135deg, #00C9B1, #00A896)';
                     } else {
-                        playButton.innerHTML = '🎮 PLAY NOW & WIN BIG!';
+                        playButton.innerHTML = 'ðŸŽ® PLAY NOW & WIN BIG!';
                         playButton.disabled = false;
                         playButton.style.background = 'var(--gold-gradient)';
                     }
@@ -4556,7 +4574,7 @@ base_html = """
                         const container = document.querySelector('.container');
                         if (container) container.insertBefore(ts, container.firstChild);
                     }
-                    ts.textContent = `🕒 ${formatter.format(time)}`;
+                    ts.textContent = `ðŸ•’ ${formatter.format(time)}`;
                 } catch (e) { 
                     console.error(e); 
                 }
@@ -4615,13 +4633,13 @@ base_html = """
                                     const div = document.createElement('div');
                                     div.className = 'game-result';
                                     div.innerHTML = `
-                                        <p><strong>🎯 Game Code:</strong> ${game.game_code}</p>
-                                        <p><strong>🕒 Timestamp:</strong> ${game.timestamp}</p>
-                                        <p><strong>👥 Players:</strong> ${game.num_users}</p>
-                                        <p><strong>💰 Total Amount:</strong> ${game.total_amount}</p>
-                                        <p><strong>🏆 Winner:</strong> ${game.winner}</p>
-                                        <p><strong>🎁 Win Amount:</strong> ${game.winner_amount}</p>
-                                        <p><strong>📊 Outcome:</strong> ${game.outcome_message}</p>
+                                        <p><strong>ðŸŽ¯ Game Code:</strong> ${game.game_code}</p>
+                                        <p><strong>ðŸ•’ Timestamp:</strong> ${game.timestamp}</p>
+                                        <p><strong>ðŸ‘¥ Players:</strong> ${game.num_users}</p>
+                                        <p><strong>ðŸ’° Total Amount:</strong> ${game.total_amount}</p>
+                                        <p><strong>ðŸ† Winner:</strong> ${game.winner}</p>
+                                        <p><strong>ðŸŽ Win Amount:</strong> ${game.winner_amount}</p>
+                                        <p><strong>ðŸ“Š Outcome:</strong> ${game.outcome_message}</p>
                                     `;
                                     resultsContainer.appendChild(div);
                                 });
@@ -4631,7 +4649,7 @@ base_html = """
                         }
 
                         if (data.current_user_queued && window.submissionProtector) {
-                            submissionProtector.handleSubmissionSuccess('✅ Already enrolled in current game');
+                            submissionProtector.handleSubmissionSuccess('âœ… Already enrolled in current game');
                         }
                     })
                     .catch(err => {
@@ -4653,9 +4671,9 @@ base_html = """
                     event.preventDefault();
                     event.stopImmediatePropagation();
                     if (window.submissionProtector.isSubmitting) {
-                        window.submissionProtector.showTemporaryMessage('⏳ Processing your previous request...', 'warning');
+                        window.submissionProtector.showTemporaryMessage('â³ Processing your previous request...', 'warning');
                     } else {
-                        window.submissionProtector.showTemporaryMessage('✅ Already enrolled in current game!', 'success');
+                        window.submissionProtector.showTemporaryMessage('âœ… Already enrolled in current game!', 'success');
                     }
                     return false;
                 }
@@ -4666,7 +4684,7 @@ base_html = """
                 }
                 if (button) { 
                     button.disabled = true; 
-                    button.innerHTML = '🎮 PROCESSING...'; 
+                    button.innerHTML = 'ðŸŽ® PROCESSING...'; 
                 }
 
                 const ga = window.gameAnimator || null;
@@ -4685,7 +4703,7 @@ base_html = """
                 setTimeout(() => {
                     if (button) { 
                         button.disabled = false; 
-                        button.innerHTML = '🎮 PLAY NOW & WIN BIG!'; 
+                        button.innerHTML = 'ðŸŽ® PLAY NOW & WIN BIG!'; 
                     }
                 }, 3000);
 
@@ -4743,7 +4761,7 @@ register_html = """<!DOCTYPE html>
 
         <div class="back-link">
             <p>Already have an account? <a href="/login">Login</a></p>
-            <p><a href="/">â† Back to Home</a></p>
+            <p><a href="/">Ã¢â€  Back to Home</a></p>
         </div>      
     </div>
 </body>
@@ -4849,750 +4867,1190 @@ admin_html = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin - HARAMBEE CASH!</title>
+    <title>Admin Dashboard - HARAMBEE CASH!</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body {
-            font-family: Arial, sans-serif;
+        :root {
+            --primary-dark: #1a1a2e;
+            --secondary-dark: #16213e;
+            --accent-gold: #ffcc00;
+            --accent-gold-light: #ffd700;
+            --success-green: #4CAF50;
+            --warning-orange: #FF9800;
+            --error-red: #f44336;
+            --info-blue: #2196F3;
+            --purple: #9C27B0;
+            --teal: #009688;
+            --text-light: #FFFFFF;
+            --text-muted: #CCCCCC;
+            --card-bg: rgba(0, 0, 0, 0.7);
+            --card-bg-light: rgba(255, 255, 255, 0.05);
+            --border-radius: 12px;
+            --shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+            --shadow-hover: 0 15px 40px rgba(0, 0, 0, 0.4);
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            --gradient-primary: linear-gradient(135deg, #43cea2, #185a9d);
+            --gradient-gold: linear-gradient(135deg, #ffcc00, #ff9900);
+            --gradient-danger: linear-gradient(135deg, #f44336, #d32f2f);
+            --gradient-success: linear-gradient(135deg, #4CAF50, #388e3c);
+        }
+        
+        * {
+            box-sizing: border-box;
             margin: 0;
             padding: 0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            background: linear-gradient(to right, #43cea2, #185a9d);
-            color: white;
-        }
-        .container {
-            width: 90%;
-            max-width: 800px;
-            padding: 20px;
-            background: rgba(0, 0, 0, 0.8);
-            border-radius: 15px;
-            text-align: center;
-            box-sizing: border-box;
-        }
-        h1 {
-            font-size: 2rem;
-            margin-bottom: 15px;
-            color: #ffcc00;
-        }
-        h2 {
-            font-size: 1.5rem;
-            margin-top: 20px;
-            color: #ffcc00;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-bottom: 20px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            overflow: hidden;
-        }
-        th, td {
-            padding: 10px;
-            border: 1px solid #ccc;
-            text-align: center;
-        }
-        th {
-            background-color: #4CAF50;
-            color: white;
-        }
-        tr:nth-child(even) {
-            background: rgba(255, 255, 255, 0.1);
-        }
-        form {
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-            text-align: left;
-        }
-        label {
-            font-size: 1rem;
-            font-weight: bold;
-            color: #ffcccb;
-        }
-        input, select, button {
-            padding: 10px;
-            font-size: 1rem;
-            border-radius: 5px;
-            border: 1px solid #ccc;
-            width: 100%;
-            box-sizing: border-box;
-        }
-        input {
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-        }
-        input:focus {
-            border-color: #ff9900;
-            outline: none;
-        }
-        select {
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-        }
-        button {
-            background-color: #4CAF50;
-            color: white;
-            cursor: pointer;
-            border: none;
-            transition: background-color 0.3s ease;
-            font-weight: bold;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-        .error {
-            color: #ffcccb;
-            font-weight: bold;
-            margin-bottom: 10px;
-        }
-        a {
-            display: inline-block;
-            margin-top: 20px;
-            color: #ffcc00;
-            text-decoration: none;
-            font-weight: bold;
-            transition: color 0.3s ease;
-        }
-        a:hover {
-            color: #ff9900;
-            text-decoration: underline;
-        }
-
-        .monitor-btn {
-            margin-top: 25px;
-            padding: 12px;
-            background-color: #ff5722;
-            color: white;
-            font-weight: bold;
-            border: none;
-            border-radius: 8px;
-            font-size: 1rem;
-            cursor: pointer;
-        }
-        .monitor-btn:hover {
-            background-color: #e64a19;
-        }
-
-        .activity-table th {
-            background-color: #3f51b5;
         }
         
-        .cashbook-btn {
-            margin-top: 25px;
-            padding: 12px;
-            background-color: #2196F3;
-            color: white;
-            font-weight: bold;
-            border: none;
-            border-radius: 8px;
-            font-size: 1rem;
-            cursor: pointer;
-        }
-        .cashbook-btn:hover {
-            background-color: #1976D2;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Admin Dashboard</h1>
-        {% if error %} <p class="error">{{ error }}</p> {% endif %}
-        {% if message %} <p class="message">{{ message }}</p> {% endif %}
-
-        <h2>All Users</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Username</th>
-                    <th>Email</th>
-                    <th>Wallet Balance</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for user in users %}
-                <tr>
-                    <td>{{ user[0] }}</td>
-                    <td>{{ user[2] }}</td>
-                    <td>{{ user[1] }}</td>
-                    <td>Ksh. {{ user[4] | round(2) }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-
-        <h2>Update User Wallet</h2>
-        <form method="POST" action="/admin/update_wallet">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <label for="user_id">User ID:</label>
-            <input type="text" id="user_id" name="user_id" required>
-            <label for="amount">Amount:</label>
-            <input type="number" id="amount" name="amount" step="0.01" required>
-            <label for="action">Action:</label>
-            <select id="action" name="action" required>
-                <option value="deposit">Deposit</option>
-                <option value="withdraw">Withdraw</option>
-            </select>
-            <button type="submit">Update Wallet</button>
-        </form>
-
-        <h2>Add Allowed Username</h2>
-        <form method="POST" action="/admin/add_allowed_user">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <label for="allowed_username">Username:</label>
-            <input type="text" id="allowed_username" name="allowed_username" required>
-            <button type="submit">Add Allowed User</button>
-        </form>      
-
-        <button class="monitor-btn" onclick="window.location.href='/admin/visitor_log'">View Visitor Log</button>
-        <button class="cashbook-btn" onclick="window.location.href='/cashbook'">ðŸ’° View Gross Profit Dashboard</button>
-        
-        <button class="cashbook-btn" onclick="window.location.href='/admin/withdrawals'" 
-                style="background-color: #9C27B0; margin-top: 15px;">
-            ðŸ’³ Manage Withdrawals
-        </button>
-        
-        <button class="cashbook-btn" onclick="window.location.href='/admin/fake_users'" 
-                style="background-color: #FF9800; margin-top: 15px;">
-            🤖 Manage Fake Users
-        </button>                        
-
-        <h2>Recent User Activity (Last 50)</h2>
-        <table class="activity-table">
-            <thead>
-                <tr>
-                    <th>Timestamp</th>
-                    <th>Username</th>
-                    <th>IP</th>
-                    <th>Path</th>
-                    <th>Method</th>
-                    <th>User Agent</th>
-                    <th>Referrer</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for log in logs %}
-                <tr>
-                    <td>{{ log[1] }}</td>
-                    <td>{{ log[2] or 'Guest' }}</td>
-                    <td>{{ log[3] }}</td>
-                    <td>{{ log[4] }}</td>
-                    <td>{{ log[5] }}</td>
-                    <td>{{ log[6][:60] }}{% if log[6]|length > 60 %}...{% endif %}</td>
-                    <td>{{ log[7] or '-' }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        
-        <a href="/admin/logout">Logout</a>
-    </div>
-    <script>
-    // Auto-refresh admin data every 1 hour
-    function refreshAdminData() {
-        location.reload();
-    }
-
-    // 1 hour = 60 minutes * 60 seconds * 1000 milliseconds
-    setTimeout(refreshAdminData, 3600000);
-
-    // Auto-clear admin messages after 1 hour
-    setTimeout(() => {
-        const errorElements = document.querySelectorAll('.error');
-        const messageElements = document.    querySelectorAll('.message');
-    
-        errorElements.forEach(el => el.style.display = 'none');
-        messageElements.forEach(el => el.style.display = 'none');
-    }, 3600000);
-    </script>
-</body>
-</html>
-"""
-
-admin_dashboard = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin - HARAMBEE CASH!</title>
-    <style>
         body {
-            font-family: Arial, sans-serif;
+            font-family: 'Segoe UI', 'Roboto', 'Arial', sans-serif;
             margin: 0;
-            padding: 0;
-            min-height: 100vh;
-            background: linear-gradient(to right, #43cea2, #185a9d);
-            color: white;
-        }
-        .container {
-            width: 95%;
-            max-width: 1200px;
-            margin: 20px auto;
             padding: 20px;
-            background: rgba(0, 0, 0, 0.8);
-            border-radius: 15px;
-            box-sizing: border-box;
-        }
-        h1 {
-            font-size: 2rem;
-            margin-bottom: 20px;
-            color: #ffcc00;
-            text-align: center;
-        }
-        h2 {
-            font-size: 1.5rem;
-            margin-top: 30px;
-            margin-bottom: 15px;
-            color: #ffcc00;
-            border-bottom: 2px solid #ffcc00;
-            padding-bottom: 5px;
+            background: var(--gradient-primary);
+            color: var(--text-light);
+            min-height: 100vh;
+            line-height: 1.6;
         }
         
-        /* Dropdown Styles */
-        .dropdown-container {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .dropdown {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            overflow: hidden;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
-        }
-        .dropdown-header {
-            background: rgba(76, 175, 80, 0.3);
-            padding: 15px;
-            font-weight: bold;
-            color: #ffcc00;
-            cursor: pointer;
+        /* Header */
+        .admin-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            transition: background 0.3s ease;
-        }
-        .dropdown-header:hover {
-            background: rgba(76, 175, 80, 0.5);
-        }
-        .dropdown-content {
-            padding: 0;
-            max-height: 0;
-            overflow: hidden;
-            transition: max-height 0.5s ease-out, padding 0.5s ease-out;
-        }
-        .dropdown-content.active {
-            padding: 20px;
-            max-height: 1000px;
-        }
-        .dropdown-icon {
-            transition: transform 0.3s ease;
-        }
-        .dropdown.active .dropdown-icon {
-            transform: rotate(180deg);
+            background: var(--card-bg);
+            padding: 20px 30px;
+            border-radius: var(--border-radius);
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(255, 204, 0, 0.1);
         }
         
-        /* Form Styles */
-        .form-group {
+        .header-left h1 {
+            color: var(--accent-gold);
+            font-size: 2.2rem;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .header-left p {
+            color: var(--text-muted);
+            margin-top: 5px;
+            font-size: 1rem;
+        }
+        
+        .admin-info {
+            background: rgba(255, 204, 0, 0.1);
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 204, 0, 0.2);
+        }
+        
+        .admin-info strong {
+            color: var(--accent-gold);
+        }
+        
+        /* Stats Dashboard */
+        .stats-dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: var(--card-bg);
+            padding: 25px;
+            border-radius: var(--border-radius);
+            box-shadow: var(--shadow);
+            border-left: 5px solid var(--accent-gold);
+            transition: var(--transition);
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: var(--shadow-hover);
+        }
+        
+        .stat-card.users { border-left-color: var(--info-blue); }
+        .stat-card.balance { border-left-color: var(--success-green); }
+        .stat-card.active { border-left-color: var(--warning-orange); }
+        .stat-card.games { border-left-color: var(--purple); }
+        
+        .stat-icon {
+            font-size: 2.5rem;
             margin-bottom: 15px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            color: #ffcccb;
-            font-weight: bold;
-            font-size: 0.9rem;
-        }
-        input, select, button, .action-btn {
-            width: 100%;
-            padding: 10px;
-            border-radius: 5px;
-            box-sizing: border-box;
-            font-size: 0.95rem;
-        }
-        input, select {
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid #ccc;
-            color: white;
-        }
-        input:focus, select:focus {
-            border-color: #ff9900;
-            outline: none;
-        }
-        button, .action-btn {
-            background-color: #4CAF50;
-            color: white;
-            border: none;
-            cursor: pointer;
-            font-weight: bold;
-            transition: background-color 0.3s ease;
-            text-align: center;
-            text-decoration: none;
-            display: block;
-        }
-        button:hover, .action-btn:hover {
-            background-color: #45a049;
+            opacity: 0.8;
         }
         
-        /* Table Styles */
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 15px 0;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            overflow: hidden;
+        .stat-value {
+            font-size: 2.2rem;
+            font-weight: 700;
+            margin: 10px 0;
         }
-        th, td {
-            padding: 12px 10px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            text-align: center;
+        
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        /* Quick Actions */
+        .quick-actions {
+            background: var(--card-bg);
+            padding: 30px;
+            border-radius: var(--border-radius);
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+        }
+        
+        .quick-actions h2 {
+            color: var(--accent-gold);
+            margin-bottom: 25px;
+            font-size: 1.6rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .action-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+        
+        .action-btn {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 20px;
+            background: var(--card-bg-light);
+            border-radius: 10px;
+            color: var(--text-light);
+            text-decoration: none;
+            transition: var(--transition);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        .action-btn:hover {
+            background: rgba(255, 204, 0, 0.1);
+            transform: translateY(-3px);
+            border-color: rgba(255, 204, 0, 0.2);
+        }
+        
+        .action-btn i {
+            font-size: 1.8rem;
+            color: var(--accent-gold);
+        }
+        
+        .action-text h3 {
+            margin: 0 0 5px 0;
+            font-size: 1.1rem;
+        }
+        
+        .action-text p {
+            margin: 0;
+            color: var(--text-muted);
             font-size: 0.9rem;
         }
-        th {
-            background-color: rgba(76, 175, 80, 0.3);
-            color: #ffcc00;
+        
+        /* Main Content Tabs */
+        .main-content {
+            background: var(--card-bg);
+            border-radius: var(--border-radius);
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+            overflow: hidden;
         }
-        tr:nth-child(even) {
+        
+        .content-tabs {
+            display: flex;
+            background: rgba(0, 0, 0, 0.3);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .tab-btn {
+            padding: 20px 30px;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            position: relative;
+        }
+        
+        .tab-btn:hover {
+            color: var(--text-light);
             background: rgba(255, 255, 255, 0.05);
         }
         
-        /* Action Buttons Grid */
-        .action-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 15px;
-            margin: 20px 0;
+        .tab-btn.active {
+            color: var(--accent-gold);
+            background: rgba(255, 204, 0, 0.05);
         }
-        .action-btn {
-            padding: 15px;
+        
+        .tab-btn.active::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: var(--accent-gold);
+        }
+        
+        .tab-content {
+            padding: 30px;
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        /* Tables */
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(255, 255, 255, 0.02);
             border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .data-table th {
+            background: rgba(76, 175, 80, 0.15);
+            color: var(--accent-gold);
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid rgba(255, 204, 0, 0.1);
+        }
+        
+        .data-table td {
+            padding: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: var(--text-light);
+        }
+        
+        .data-table tr:last-child td {
+            border-bottom: none;
+        }
+        
+        .data-table tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .wallet-badge {
+            background: rgba(76, 175, 80, 0.2);
+            color: #4CAF50;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+        
+        /* Forms */
+        .form-section {
+            background: rgba(255, 255, 255, 0.02);
+            padding: 25px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        .form-section h3 {
+            color: var(--accent-gold);
+            margin-bottom: 20px;
+            font-size: 1.3rem;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+        
+        input, select, textarea {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-light);
+            border-radius: 6px;
             font-size: 1rem;
-            display: flex;
+            transition: var(--transition);
+        }
+        
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent-gold);
+            box-shadow: 0 0 0 2px rgba(255, 204, 0, 0.1);
+        }
+        
+        .btn {
+            padding: 12px 25px;
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            display: inline-flex;
             align-items: center;
-            justify-content: center;
-            gap: 10px;
+            gap: 8px;
         }
-        .action-btn.visitor {
-            background-color: #ff5722;
+        
+        .btn-primary {
+            background: var(--gradient-success);
+            color: white;
         }
-        .action-btn.visitor:hover {
-            background-color: #e64a19;
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(76, 175, 80, 0.3);
         }
-        .action-btn.cashbook {
-            background-color: #2196F3;
+        
+        .btn-warning {
+            background: var(--gradient-gold);
+            color: #333;
         }
-        .action-btn.cashbook:hover {
-            background-color: #1976D2;
+        
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(255, 204, 0, 0.3);
         }
-        .action-btn.withdrawals {
-            background-color: #9C27B0;
+        
+        .btn-danger {
+            background: var(--gradient-danger);
+            color: white;
         }
-        .action-btn.withdrawals:hover {
-            background-color: #7B1FA2;
-        }
-        .action-btn.deposits {
-            background-color: #FF9800;
-        }
-        .action-btn.deposits:hover {
-            background-color: #F57C00;
-        }
-        .action-btn.auto-player {
-            background-color: #9C27B0;
-        }
-        .action-btn.auto-player:hover {
-            background-color: #7B1FA2;
+        
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(244, 67, 54, 0.3);
         }
         
         /* Messages */
-        .error {
-            background: rgba(255, 107, 53, 0.2);
-            color: #ffcccb;
-            padding: 12px;
+        .alert {
+            padding: 15px 20px;
             border-radius: 8px;
             margin-bottom: 20px;
-            border-left: 4px solid #FF6B35;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-left: 4px solid;
         }
-        .message {
-            background: rgba(0, 201, 177, 0.2);
-            color: #00C9B1;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            border-left: 4px solid #00C9B1;
+        
+        .alert-success {
+            background: rgba(76, 175, 80, 0.1);
+            border-left-color: var(--success-green);
+            color: #4CAF50;
+        }
+        
+        .alert-error {
+            background: rgba(244, 67, 54, 0.1);
+            border-left-color: var(--error-red);
+            color: #f44336;
+        }
+        
+        .alert-warning {
+            background: rgba(255, 152, 0, 0.1);
+            border-left-color: var(--warning-orange);
+            color: #FF9800;
         }
         
         /* Footer */
-        .footer {
+        .admin-footer {
             text-align: center;
+            padding: 25px;
+            background: var(--card-bg);
+            border-radius: var(--border-radius);
             margin-top: 30px;
-            padding-top: 20px;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: var(--shadow);
         }
-        .logout-link {
-            color: #ffcc00;
-            text-decoration: none;
-            font-weight: bold;
-            padding: 10px 20px;
-            background: rgba(255, 0, 0, 0.2);
-            border-radius: 5px;
-            transition: background 0.3s ease;
+        
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-bottom: 20px;
         }
-        .logout-link:hover {
-            background: rgba(255, 0, 0, 0.3);
+        
+        .footer-link {
+            color: var(--text-muted);
             text-decoration: none;
+            transition: var(--transition);
+        }
+        
+        .footer-link:hover {
+            color: var(--accent-gold);
+        }
+        
+        .logout-btn {
+            background: rgba(244, 67, 54, 0.1);
+            color: #f44336;
+            border: 1px solid rgba(244, 67, 54, 0.3);
+            padding: 10px 25px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: var(--transition);
+        }
+        
+        .logout-btn:hover {
+            background: rgba(244, 67, 54, 0.2);
+            transform: translateY(-2px);
         }
         
         /* Responsive */
-        @media (max-width: 768px) {
-            .container {
-                padding: 15px;
-                margin: 10px;
-                width: calc(100% - 20px);
+        @media (max-width: 1200px) {
+            .action-grid {
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
             }
-            .dropdown-container {
+        }
+        
+        @media (max-width: 992px) {
+            .stats-dashboard {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            .admin-header {
+                flex-direction: column;
+                text-align: center;
+                gap: 20px;
+            }
+            
+            .content-tabs {
+                flex-wrap: wrap;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .stats-dashboard {
                 grid-template-columns: 1fr;
             }
+            
             .action-grid {
                 grid-template-columns: 1fr;
             }
-            th, td {
-                padding: 8px 5px;
-                font-size: 0.8rem;
+            
+            .content-tabs {
+                flex-direction: column;
             }
+            
+            .tab-btn {
+                padding: 15px;
+                text-align: left;
+            }
+            
+            .data-table {
+                display: block;
+                overflow-x: auto;
+            }
+            
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+            
+            body {
+                padding: 10px;
+            }
+        }
+        
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .fade-in {
+            animation: fadeIn 0.5s ease-out;
+        }
+        
+        /* Status indicators */
+        .status-badge {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: inline-block;
+        }
+        
+        .status-active { background: rgba(76, 175, 80, 0.2); color: #4CAF50; }
+        .status-pending { background: rgba(255, 152, 0, 0.2); color: #FF9800; }
+        .status-suspended { background: rgba(244, 67, 54, 0.2); color: #f44336; }
+        .status-completed { background: rgba(33, 150, 243, 0.2); color: #2196F3; }
+        
+        /* Search and Filter */
+        .search-filter {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .search-box {
+            flex: 1;
+            min-width: 250px;
+        }
+        
+        .filter-select {
+            min-width: 200px;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>👑 Admin Dashboard</h1>
-        
-        {% if error %} <div class="error">{{ error }}</div> {% endif %}
-        {% if message %} <div class="message">{{ message }}</div> {% endif %}
-        
-        <!-- Quick Action Grid -->
-        <div class="action-grid">
-            <a href="/admin/visitor_log" class="action-btn visitor">
-                👁️ Visitor Log
-            </a>
-            <a href="/cashbook" class="action-btn cashbook">
-                💰 Cashbook
-            </a>
-            <a href="/admin/withdrawals" class="action-btn withdrawals">
-                💳 Withdrawals
-            </a>
-            <a href="/admin/deposits" class="action-btn deposits">
-                💵 Deposits
-            </a>            
-            <a href="/admin/deposits" class="action-btn deposits">
-                💵 Deposits
-            </a>
-            <a href="/admin/auto_player" class="action-btn auto-player">
-                🤖 Auto-Player
-            </a>
+    <!-- Header -->
+    <header class="admin-header fade-in">
+        <div class="header-left">
+            <h1><i class="fas fa-crown"></i> Admin Dashboard</h1>
+            <p>Complete control panel for HARAMBEE CASH platform</p>
+        </div>
+        <div class="admin-info">
+            <p><i class="fas fa-user-shield"></i> Logged in as: <strong>{{ session.get('admin_username', 'Admin') }}</strong></p>
+            <p><i class="fas fa-clock"></i> Session: {{ session.get('_fresh', 'Active') }}</p>
+        </div>
+    </header>
+    
+    <!-- Stats Dashboard -->
+    <div class="stats-dashboard fade-in">
+        <div class="stat-card users">
+            <div class="stat-icon"><i class="fas fa-users"></i></div>
+            <div class="stat-value">{{ users|length }}</div>
+            <div class="stat-label">Total Users</div>
         </div>
         
-        <!-- Dropdown Container -->
-        <div class="dropdown-container">
-            
-            <!-- User Management Dropdown -->
-            <div class="dropdown">
-                <div class="dropdown-header" onclick="toggleDropdown(this)">
-                    👥 User Management
-                    <span class="dropdown-icon">▼</span>
+        <div class="stat-card balance">
+            <div class="stat-icon"><i class="fas fa-wallet"></i></div>
+            <div class="stat-value">Ksh {{ "%.2f"|format(total_balance) if total_balance else "0.00" }}</div>
+            <div class="stat-label">Total Platform Balance</div>
+        </div>
+        
+        <div class="stat-card active">
+            <div class="stat-icon"><i class="fas fa-gamepad"></i></div>
+            <div class="stat-value">{{ active_games if active_games else 0 }}</div>
+            <div class="stat-label">Active Games</div>
+        </div>
+        
+        <div class="stat-card games">
+            <div class="stat-icon"><i class="fas fa-trophy"></i></div>
+            <div class="stat-value">{{ completed_games if completed_games else 0 }}</div>
+            <div class="stat-label">Games Completed</div>
+        </div>
+    </div>
+    
+    <!-- Quick Actions -->
+    <section class="quick-actions fade-in">
+        <h2><i class="fas fa-bolt"></i> Quick Actions</h2>
+        <div class="action-grid">
+            <a href="/cashbook" class="action-btn">
+                <i class="fas fa-chart-line"></i>
+                <div class="action-text">
+                    <h3>Financial Dashboard</h3>
+                    <p>View platform profits & financial reports</p>
                 </div>
-                <div class="dropdown-content">
-                    <h3>All Users ({{ users|length }})</h3>
-                    <div style="overflow-x: auto;">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>Username</th>
-                                    <th>Email</th>
-                                    <th>Wallet Balance</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for user in users %}
-                                <tr>
-                                    <td>{{ user[0] }}</td>
-                                    <td>{{ user[2] }}</td>
-                                    <td>{{ user[1] }}</td>
-                                    <td>Ksh. {{ user[4] | round(2) }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
+            </a>
+            
+            <a href="/admin/withdrawals" class="action-btn">
+                <i class="fas fa-money-check-alt"></i>
+                <div class="action-text">
+                    <h3>Withdrawals</h3>
+                    <p>Manage user withdrawal requests</p>
+                </div>
+            </a>
+            
+            <a href="/admin/visitor_log" class="action-btn">
+                <i class="fas fa-eye"></i>
+                <div class="action-text">
+                    <h3>Visitor Analytics</h3>
+                    <p>View site traffic and user activity</p>
+                </div>
+            </a>
+            
+            <a href="/admin/auto_player" class="action-btn">
+                <i class="fas fa-robot"></i>
+                <div class="action-text">
+                    <h3>Auto-Player</h3>
+                    <p>Manage automated fake players</p>
+                </div>
+            </a>
+            
+            <a href="#" onclick="showTab('userManagement')" class="action-btn">
+                <i class="fas fa-user-cog"></i>
+                <div class="action-text">
+                    <h3>User Management</h3>
+                    <p>Add, edit, or suspend users</p>
+                </div>
+            </a>
+            
+            <a href="#" onclick="showTab('walletManagement')" class="action-btn">
+                <i class="fas fa-coins"></i>
+                <div class="action-text">
+                    <h3>Wallet Controls</h3>
+                    <p>Deposit or withdraw user funds</p>
+                </div>
+            </a>
+        </div>
+    </section>
+    
+    <!-- Messages -->
+    {% if error %}
+    <div class="alert alert-error fade-in">
+        <i class="fas fa-exclamation-circle"></i>
+        <div>{{ error }}</div>
+    </div>
+    {% endif %}
+    
+    {% if message %}
+    <div class="alert alert-success fade-in">
+        <i class="fas fa-check-circle"></i>
+        <div>{{ message }}</div>
+    </div>
+    {% endif %}
+    
+    <!-- Main Content Tabs -->
+    <div class="main-content fade-in">
+        <div class="content-tabs">
+            <button class="tab-btn active" onclick="showTab('userManagement')">
+                <i class="fas fa-users"></i> User Management
+            </button>
+            <button class="tab-btn" onclick="showTab('walletManagement')">
+                <i class="fas fa-wallet"></i> Wallet Management
+            </button>
+            <button class="tab-btn" onclick="showTab('registrationControl')">
+                <i class="fas fa-user-plus"></i> Registration Control
+            </button>
+            <button class="tab-btn" onclick="showTab('activityMonitor')">
+                <i class="fas fa-chart-bar"></i> Activity Monitor
+            </button>
+        </div>
+        
+        <!-- User Management Tab -->
+        <div id="userManagement" class="tab-content active">
+            <div class="form-section">
+                <h3><i class="fas fa-search"></i> Search & Filter Users</h3>
+                <div class="search-filter">
+                    <div class="search-box">
+                        <input type="text" id="userSearch" placeholder="Search by username, email, or ID..." 
+                               onkeyup="filterUsers()">
+                    </div>
+                    <div class="filter-select">
+                        <select id="userFilter" onchange="filterUsers()">
+                            <option value="all">All Users</option>
+                            <option value="active">Active</option>
+                            <option value="suspended">Suspended</option>
+                            <option value="fake">Fake Users</option>
+                        </select>
                     </div>
                 </div>
             </div>
             
-            <!-- Wallet Management Dropdown -->
-            <div class="dropdown">
-                <div class="dropdown-header" onclick="toggleDropdown(this)">
-                    💳 Wallet Management
-                    <span class="dropdown-icon">▼</span>
+            <div class="form-section">
+                <h3><i class="fas fa-list"></i> All Users ({{ users|length }})</h3>
+                <div style="overflow-x: auto; max-height: 500px; overflow-y: auto;">
+                    <table class="data-table" id="userTable">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Username</th>
+                                <th>Email</th>
+                                <th>Wallet Balance</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for user in users %}
+                            <tr>
+                                <td>{{ user[0] }}</td>
+                                <td><strong>{{ user[2] }}</strong></td>
+                                <td>{{ user[1] }}</td>
+                                <td><span class="wallet-badge">Ksh {{ user[4] | round(2) }}</span></td>
+                                <td>
+                                    {% if user_suspensions.get(user[0]) %}
+                                    <span class="status-badge status-suspended">Suspended</span>
+                                    {% else %}
+                                    <span class="status-badge status-active">Active</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <button class="btn btn-warning btn-sm" onclick="manageUser({{ user[0] }})" 
+                                            style="padding: 5px 10px; font-size: 0.85rem;">
+                                        <i class="fas fa-edit"></i> Manage
+                                    </button>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
-                <div class="dropdown-content">
-                    <h3>Update User Wallet</h3>
-                    <form method="POST" action="/admin/update_wallet">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            </div>
+        </div>
+        
+        <!-- Wallet Management Tab -->
+        <div id="walletManagement" class="tab-content">
+            <div class="form-section">
+                <h3><i class="fas fa-money-bill-wave"></i> Update User Wallet</h3>
+                <form method="POST" action="/admin/update_wallet" id="walletForm">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    
+                    <div class="form-row">
                         <div class="form-group">
-                            <label for="user_id">User ID:</label>
-                            <input type="text" id="user_id" name="user_id" required placeholder="Enter User ID">
+                            <label for="user_id"><i class="fas fa-user"></i> User ID</label>
+                            <input type="text" id="user_id" name="user_id" required 
+                                   placeholder="Enter User ID" onchange="fetchUserDetails(this.value)">
                         </div>
+                        
                         <div class="form-group">
-                            <label for="amount">Amount (KES):</label>
-                            <input type="number" id="amount" name="amount" step="0.01" required placeholder="0.00" min="0.01">
+                            <label for="amount"><i class="fas fa-coins"></i> Amount (KES)</label>
+                            <input type="number" id="amount" name="amount" step="0.01" required 
+                                   placeholder="0.00" min="0.01">
                         </div>
+                        
                         <div class="form-group">
-                            <label for="action">Action:</label>
-                            <select id="action" name="action" required>
+                            <label for="action"><i class="fas fa-exchange-alt"></i> Action</label>
+                            <select id="action" name="action" required onchange="updateAmountLabel()">
                                 <option value="">Select Action</option>
                                 <option value="deposit">Deposit</option>
                                 <option value="withdraw">Withdraw</option>
                             </select>
                         </div>
-                        <button type="submit">Update Wallet</button>
-                    </form>
-                </div>
-            </div>
-            
-            <!-- Registration Control Dropdown -->
-            <div class="dropdown">
-                <div class="dropdown-header" onclick="toggleDropdown(this)">
-                    🔐 Registration Control
-                    <span class="dropdown-icon">▼</span>
-                </div>
-                <div class="dropdown-content">
-                    <h3>Add Allowed Username</h3>
-                    <form method="POST" action="/admin/add_allowed_user">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <div class="form-group">
-                            <label for="allowed_username">Username:</label>
-                            <input type="text" id="allowed_username" name="allowed_username" required placeholder="Enter username to allow">
+                    </div>
+                    
+                    <div class="form-group" id="userDetails" style="display: none;">
+                        <div style="background: rgba(255, 204, 0, 0.05); padding: 15px; border-radius: 8px;">
+                            <p><strong id="userName"></strong></p>
+                            <p>Current Balance: <span id="currentBalance" class="wallet-badge"></span></p>
+                            <p>New Balance: <span id="newBalance" class="wallet-badge"></span></p>
                         </div>
-                        <button type="submit">Add Allowed User</button>
-                    </form>
-                </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="notes"><i class="fas fa-sticky-note"></i> Admin Notes (Optional)</label>
+                        <textarea id="notes" name="notes" rows="3" placeholder="Add notes about this transaction..."></textarea>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-check-circle"></i> Update Wallet
+                    </button>
+                </form>
+            </div>
+        </div>
+        
+        <!-- Registration Control Tab -->
+        <div id="registrationControl" class="tab-content">
+            <div class="form-section">
+                <h3><i class="fas fa-user-plus"></i> Add Allowed Username</h3>
+                <form method="POST" action="/admin/add_allowed_user" id="allowedUserForm">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="allowed_username"><i class="fas fa-user-tag"></i> Username</label>
+                            <input type="text" id="allowed_username" name="allowed_username" required 
+                                   placeholder="Enter username to allow registration">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="email_template"><i class="fas fa-envelope"></i> Email Template</label>
+                            <select id="email_template" name="email_template">
+                                <option value="">Select Email Domain</option>
+                                <option value="@gmail.com">@gmail.com</option>
+                                <option value="@yahoo.com">@yahoo.com</option>
+                                <option value="@outlook.com">@outlook.com</option>
+                                <option value="custom">Custom Email</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group" id="customEmail" style="display: none;">
+                        <label for="custom_email"><i class="fas fa-at"></i> Custom Email</label>
+                        <input type="text" id="custom_email" name="custom_email" 
+                               placeholder="user@example.com">
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-user-check"></i> Add Allowed User
+                    </button>
+                </form>
             </div>
             
-            <!-- Activity Monitor Dropdown -->
-            <div class="dropdown">
-                <div class="dropdown-header" onclick="toggleDropdown(this)">
-                    📊 Activity Monitor
-                    <span class="dropdown-icon">▼</span>
-                </div>
-                <div class="dropdown-content">
-                    <h3>Recent User Activity (Last 100)</h3>
-                    <div style="overflow-x: auto; max-height: 400px;">
-                        <table class="activity-table">
-                            <thead>
-                                <tr>
-                                    <th>Timestamp</th>
-                                    <th>Username</th>
-                                    <th>IP</th>
-                                    <th>Path</th>
-                                    <th>Method</th>
-                                    <th>User Agent</th>
-                                    <th>Referrer</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for log in logs %}
-                                <tr>
-                                    <td>{{ log[1] }}</td>
-                                    <td>{{ log[2] or 'Guest' }}</td>
-                                    <td>{{ log[3] }}</td>
-                                    <td>{{ log[4] }}</td>
-                                    <td>{{ log[5] }}</td>
-                                    <td title="{{ log[6] }}">{{ log[6][:40] }}{% if log[6]|length > 40 %}...{% endif %}</td>
-                                    <td>{{ log[7] or '-' }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
+            <div class="form-section">
+                <h3><i class="fas fa-list-check"></i> Allowed Usernames</h3>
+                {% if allowed_users %}
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Username</th>
+                            <th>Added Date</th>
+                            <th>Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for allowed in allowed_users %}
+                        <tr>
+                            <td>{{ allowed[0] }}</td>
+                            <td>{{ allowed[1] if allowed[1] else 'N/A' }}</td>
+                            <td>
+                                {% if allowed[2] %}
+                                <span class="status-badge status-active">Used</span>
+                                {% else %}
+                                <span class="status-badge status-pending">Available</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <button class="btn btn-danger btn-sm" onclick="removeAllowedUser('{{ allowed[0] }}')"
+                                        style="padding: 5px 10px; font-size: 0.85rem;">
+                                    <i class="fas fa-trash"></i> Remove
+                                </button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <p style="color: var(--text-muted); text-align: center; padding: 20px;">
+                    <i class="fas fa-inbox"></i> No allowed usernames found
+                </p>
+                {% endif %}
+            </div>
+        </div>
+        
+        <!-- Activity Monitor Tab -->
+        <div id="activityMonitor" class="tab-content">
+            <div class="form-section">
+                <h3><i class="fas fa-history"></i> Recent User Activity (Last 100)</h3>
+                
+                <div class="search-filter">
+                    <div class="search-box">
+                        <input type="text" id="activitySearch" placeholder="Search activity..." 
+                               onkeyup="filterActivity()">
+                    </div>
+                    <div class="filter-select">
+                        <select id="activityFilter" onchange="filterActivity()">
+                            <option value="all">All Activity</option>
+                            <option value="login">Logins</option>
+                            <option value="game">Game Plays</option>
+                            <option value="transaction">Transactions</option>
+                            <option value="admin">Admin Actions</option>
+                        </select>
                     </div>
                 </div>
+                
+                <div style="overflow-x: auto; max-height: 500px; overflow-y: auto;">
+                    <table class="data-table" id="activityTable">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Username</th>
+                                <th>IP Address</th>
+                                <th>Path</th>
+                                <th>Method</th>
+                                <th>User Agent</th>
+                                <th>Referrer</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for log in logs %}
+                            <tr>
+                                <td>{{ log[1].strftime('%H:%M:%S') if log[1] else 'N/A' }}</td>
+                                <td><strong>{{ log[2] or 'Guest' }}</strong></td>
+                                <td>{{ log[3] or 'N/A' }}</td>
+                                <td>{{ log[4] or 'N/A' }}</td>
+                                <td>
+                                    {% if log[5] == 'GET' %}
+                                    <span class="status-badge status-completed">{{ log[5] }}</span>
+                                    {% elif log[5] == 'POST' %}
+                                    <span class="status-badge status-pending">{{ log[5] }}</span>
+                                    {% else %}
+                                    {{ log[5] }}
+                                    {% endif %}
+                                </td>
+                                <td title="{{ log[6] }}">
+                                    {{ log[6][:30] if log[6] else 'N/A' }}{% if log[6] and log[6]|length > 30 %}...{% endif %}
+                                </td>
+                                <td>{{ log[7] or 'Direct' }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
-            
-        </div> <!-- End dropdown-container -->
-        
-        <!-- Footer -->
-        <div class="footer">
-            <a href="/admin/logout" class="logout-link">🚪 Logout</a>
         </div>
     </div>
-
+    
+    <!-- Footer -->
+    <footer class="admin-footer fade-in">
+        <div class="footer-links">
+            <a href="/" class="footer-link"><i class="fas fa-home"></i> Home</a>
+            <a href="/docs" class="footer-link"><i class="fas fa-book"></i> Documentation</a>
+            <a href="/privacy" class="footer-link"><i class="fas fa-shield-alt"></i> Privacy</a>
+            <a href="/terms" class="footer-link"><i class="fas fa-file-contract"></i> Terms</a>
+        </div>
+        
+        <p style="color: var(--text-muted); margin-bottom: 20px;">
+            <i class="fas fa-server"></i> Server Time: <span id="serverTime"></span>
+        </p>
+        
+        <a href="/admin/logout" class="logout-btn">
+            <i class="fas fa-sign-out-alt"></i> Logout
+        </a>
+    </footer>
+    
     <script>
-        // Toggle dropdowns
-        function toggleDropdown(header) {
-            const dropdown = header.parentElement;
-            const content = dropdown.querySelector('.dropdown-content');
-            const icon = dropdown.querySelector('.dropdown-icon');
+        // Tab Navigation
+        function showTab(tabId) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
             
-            dropdown.classList.toggle('active');
-            content.classList.toggle('active');
+            // Remove active class from all buttons
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
             
-            if (content.classList.contains('active')) {
-                content.style.maxHeight = content.scrollHeight + "px";
-            } else {
-                content.style.maxHeight = '0';
+            // Show selected tab
+            document.getElementById(tabId).classList.add('active');
+            
+            // Activate corresponding button
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                if (btn.getAttribute('onclick') === `showTab('${tabId}')`) {
+                    btn.classList.add('active');
+                }
+            });
+        }
+        
+        // User Search and Filter
+        function filterUsers() {
+            const search = document.getElementById('userSearch').value.toLowerCase();
+            const filter = document.getElementById('userFilter').value;
+            const rows = document.querySelectorAll('#userTable tbody tr');
+            
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                const username = row.cells[1].textContent.toLowerCase();
+                const status = row.cells[4].textContent.toLowerCase();
+                
+                let matchesSearch = text.includes(search);
+                let matchesFilter = true;
+                
+                if (filter === 'active') {
+                    matchesFilter = status.includes('active');
+                } else if (filter === 'suspended') {
+                    matchesFilter = status.includes('suspended');
+                } else if (filter === 'fake') {
+                    matchesFilter = username.includes('bot_');
+                }
+                
+                row.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+            });
+        }
+        
+        // Activity Filter
+        function filterActivity() {
+            const search = document.getElementById('activitySearch').value.toLowerCase();
+            const filter = document.getElementById('activityFilter').value;
+            const rows = document.querySelectorAll('#activityTable tbody tr');
+            
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                const path = row.cells[3].textContent.toLowerCase();
+                
+                let matchesSearch = text.includes(search);
+                let matchesFilter = true;
+                
+                if (filter === 'login') {
+                    matchesFilter = path.includes('login');
+                } else if (filter === 'game') {
+                    matchesFilter = path.includes('play') || path.includes('game');
+                } else if (filter === 'transaction') {
+                    matchesFilter = path.includes('deposit') || path.includes('withdraw');
+                } else if (filter === 'admin') {
+                    matchesFilter = path.includes('admin');
+                }
+                
+                row.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+            });
+        }
+        
+        // Wallet Management
+        let currentUserBalance = 0;
+        
+        async function fetchUserDetails(userId) {
+            try {
+                const response = await fetch(`/admin/user_details/${userId}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('userDetails').style.display = 'block';
+                    document.getElementById('userName').textContent = `User: ${data.username} (ID: ${userId})`;
+                    document.getElementById('currentBalance').textContent = `Ksh ${data.balance}`;
+                    currentUserBalance = parseFloat(data.balance);
+                    updateAmountLabel();
+                }
+            } catch (error) {
+                console.error('Error fetching user details:', error);
             }
         }
         
-        // Auto-expand first dropdown on load
-        document.addEventListener('DOMContentLoaded', function() {
-            const firstDropdown = document.querySelector('.dropdown');
-            if (firstDropdown) {
-                firstDropdown.classList.add('active');
-                const content = firstDropdown.querySelector('.dropdown-content');
-                content.classList.add('active');
-                content.style.maxHeight = content.scrollHeight + "px";
+        function updateAmountLabel() {
+            const amount = parseFloat(document.getElementById('amount').value) || 0;
+            const action = document.getElementById('action').value;
+            const newBalanceElement = document.getElementById('newBalance');
+            
+            if (action && !isNaN(currentUserBalance)) {
+                let newBalance = currentUserBalance;
+                if (action === 'deposit') {
+                    newBalance += amount;
+                } else if (action === 'withdraw') {
+                    newBalance -= amount;
+                }
+                
+                newBalanceElement.textContent = `Ksh ${newBalance.toFixed(2)}`;
+                
+                // Color code based on balance
+                if (newBalance < 0) {
+                    newBalanceElement.style.backgroundColor = 'rgba(244, 67, 54, 0.3)';
+                    newBalanceElement.style.color = '#f44336';
+                } else if (newBalance < 10) {
+                    newBalanceElement.style.backgroundColor = 'rgba(255, 152, 0, 0.3)';
+                    newBalanceElement.style.color = '#FF9800';
+                } else {
+                    newBalanceElement.style.backgroundColor = 'rgba(76, 175, 80, 0.3)';
+                    newBalanceElement.style.color = '#4CAF50';
+                }
+            }
+        }
+        
+        // Email template handler
+        document.getElementById('email_template').addEventListener('change', function() {
+            const customEmailDiv = document.getElementById('customEmail');
+            if (this.value === 'custom') {
+                customEmailDiv.style.display = 'block';
+            } else {
+                customEmailDiv.style.display = 'none';
             }
         });
         
-        // Auto-refresh admin data every 30 minutes
+        // Form validation
+        document.getElementById('walletForm').addEventListener('submit', function(e) {
+            const amount = parseFloat(document.getElementById('amount').value);
+            const action = document.getElementById('action').value;
+            
+            if (action === 'withdraw' && amount > currentUserBalance) {
+                e.preventDefault();
+                alert('Withdrawal amount cannot exceed user balance!');
+            }
+        });
+        
+        // User management
+        function manageUser(userId) {
+            const modal = document.createElement('div');
+            modal.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0,0,0,0.8);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                z-index: 1000;
+            `;
+            
+            modal.innerHTML = `
+                <div style="background: var(--card-bg); padding: 30px; border-radius: 15px; max-width: 500px; width: 90%;">
+                    <h2 style="color: var(--accent-gold); margin-bottom: 20px;">Manage User ${userId}</h2>
+                    <div style="margin-bottom: 20px;">
+                        <button class="btn btn-warning" style="width: 100%; margin-bottom: 10px;">
+                            <i class="fas fa-edit"></i> Edit User Details
+                        </button>
+                        <button class="btn btn-danger" style="width: 100%; margin-bottom: 10px;">
+                            <i class="fas fa-ban"></i> Suspend User
+                        </button>
+                        <button class="btn btn-primary" style="width: 100%; margin-bottom: 10px;">
+                            <i class="fas fa-history"></i> View Transaction History
+                        </button>
+                    </div>
+                    <button onclick="this.parentElement.parentElement.remove()" class="btn" 
+                            style="width: 100%; background: #666;">
+                        <i class="fas fa-times"></i> Close
+                    </button>
+                </div>
+            `;
+            
+            document.body.appendChild(modal);
+        }
+        
+        function removeAllowedUser(username) {
+            if (confirm(`Are you sure you want to remove "${username}" from allowed users?`)) {
+                // Add AJAX call here to remove user
+                fetch('/admin/remove_allowed_user', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: `username=${encodeURIComponent(username)}`
+                }).then(response => {
+                    if (response.ok) {
+                        location.reload();
+                    }
+                });
+            }
+        }
+        
+        // Server time
+        function updateServerTime() {
+            const now = new Date();
+            document.getElementById('serverTime').textContent = 
+                now.toLocaleString('en-KE', { 
+                    weekday: 'long', 
+                    year: 'numeric', 
+                    month: 'long', 
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                });
+        }
+        
+        // Auto-refresh data every 2 minutes
         setTimeout(() => {
             location.reload();
-        }, 1800000); // 30 minutes
+        }, 120000);
         
-        // Auto-clear messages after 10 seconds
-        setTimeout(() => {
-            const errorElements = document.querySelectorAll('.error');
-            const messageElements = document.querySelectorAll('.message');
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            updateServerTime();
+            setInterval(updateServerTime, 1000);
             
-            errorElements.forEach(el => {
-                el.style.opacity = '0';
-                el.style.transition = 'opacity 0.5s ease';
-                setTimeout(() => el.remove(), 500);
-            });
-            
-            messageElements.forEach(el => {
-                el.style.opacity = '0';
-                el.style.transition = 'opacity 0.5s ease';
-                setTimeout(() => el.remove(), 500);
-            });
-        }, 10000);
-        
-        // Form validation
-        document.addEventListener('submit', function(e) {
-            if (e.target.tagName === 'FORM') {
-                const submitBtn = e.target.querySelector('button[type="submit"]');
-                if (submitBtn) {
-                    submitBtn.disabled = true;
-                    submitBtn.innerHTML = 'Processing...';
-                    setTimeout(() => {
-                        submitBtn.disabled = false;
-                        submitBtn.innerHTML = 'Update Wallet';
-                    }, 3000);
-                }
-            }
+            // Auto-clear messages after 10 seconds
+            setTimeout(() => {
+                document.querySelectorAll('.alert').forEach(alert => {
+                    alert.style.opacity = '0';
+                    setTimeout(() => alert.remove(), 500);
+                });
+            }, 10000);
         });
     </script>
 </body>
@@ -5670,7 +6128,7 @@ TERMS_CONTENT = """
         </script>      
         
         <p><strong>Last Updated:</strong> 6th February 2025</p>
-        <p>Welcome to <strong>Harambee Cash</strong> â€” your platform for exciting gameplay and rewards! Before getting started, please read through our Terms and Conditions carefully. By using our platform, you agree to these terms.</p>
+        <p>Welcome to <strong>Harambee Cash</strong> Ã¢â‚¬â€ your platform for exciting gameplay and rewards! Before getting started, please read through our Terms and Conditions carefully. By using our platform, you agree to these terms.</p>
 
         <h3>1. Acceptance of Terms</h3>
         <p>By accessing or using Harambee Cash, you agree to comply with these Terms and Conditions. If you do not agree with any part, please do not use the platform.</p>
@@ -5684,7 +6142,7 @@ TERMS_CONTENT = """
         <h3>3. Account Registration</h3>
         <ul>
             <li>An account is required to access the platform's features.</li>
-            <li>Keep your login credentials secureâ€”you are accountable for all activity under your account.</li>
+            <li>Keep your login credentials secureÃ¢â‚¬â€you are accountable for all activity under your account.</li>
         </ul>
 
         <h3>4. Game Rules</h3>
@@ -5716,7 +6174,7 @@ TERMS_CONTENT = """
         <footer>
             <p>&copy; 2025 Pigasimu. All rights reserved.</p>
         </footer>
-        <a href="/">â† Back to Home</a>
+        <a href="/">Ã¢â€  Back to Home</a>
     </div> 
 </body>
 </html>
@@ -5833,7 +6291,7 @@ PRIVACY_CONTENT = """
         <footer>
             <p>&copy; 2025 Pigasimu. All rights reserved.</p>
         </footer>
-        <a href="/">â† Back to Home</a>
+        <a href="/">Ã¢â€  Back to Home</a>
     </div>   
 </body>
 </html>
@@ -5919,14 +6377,14 @@ DOCS_CONTENT = """
 
         <h2>API Endpoints</h2>
         <ul>
-            <li><strong>GET /</strong> â€“ Homepage</li>
-            <li><strong>POST /register</strong> â€“ Register a new user</li>
-            <li><strong>POST /login</strong> â€“ User login</li>
-            <li><strong>GET /logout</strong> â€“ User logout</li>
-            <li><strong>POST /play</strong> â€“ Enroll in next game</li>
-            <li><strong>GET /admin/login</strong> â€“ Admin login</li>
-            <li><strong>GET /admin/dashboard</strong> â€“ Admin panel</li>
-            <li><strong>GET /admin/logout</strong> â€“ Admin logout</li>
+            <li><strong>GET /</strong> Ã¢â‚¬â€œ Homepage</li>
+            <li><strong>POST /register</strong> Ã¢â‚¬â€œ Register a new user</li>
+            <li><strong>POST /login</strong> Ã¢â‚¬â€œ User login</li>
+            <li><strong>GET /logout</strong> Ã¢â‚¬â€œ User logout</li>
+            <li><strong>POST /play</strong> Ã¢â‚¬â€œ Enroll in next game</li>
+            <li><strong>GET /admin/login</strong> Ã¢â‚¬â€œ Admin login</li>
+            <li><strong>GET /admin/dashboard</strong> Ã¢â‚¬â€œ Admin panel</li>
+            <li><strong>GET /admin/logout</strong> Ã¢â‚¬â€œ Admin logout</li>
         </ul>
 
         <h2>Security Measures</h2>
@@ -5959,7 +6417,7 @@ DOCS_CONTENT = """
         <footer>
             <p>&copy; 2025 Pigasimu. All rights reserved.</p>
         </footer>
-        <a href="/">â† Back to Home</a>
+        <a href="/">Ã¢â€  Back to Home</a>
     </div>   
 </body>
 </html>
@@ -6269,7 +6727,7 @@ auto_player_html = """
     <div class="container">
         <!-- Header -->
         <div class="header">
-            <h1>🤖 Auto-Player Control Panel</h1>
+            <h1>ðŸ¤– Auto-Player Control Panel</h1>
             <p>Manage automated fake players to keep the platform active</p>
         </div>
         
@@ -6313,12 +6771,12 @@ auto_player_html = """
         
         <!-- Control Panel -->
         <div class="control-panel">
-            <h2>⚙️ Control Actions</h2>
+            <h2>âš™ï¸ Control Actions</h2>
             
             <div class="control-grid">
                 <!-- Create Fake Users -->
                 <div class="control-form">
-                    <h3>📝 Create Fake Users</h3>
+                    <h3>ðŸ“ Create Fake Users</h3>
                     <p style="color: var(--text-muted); margin-bottom: 15px;">
                         Create 50 fake users with Ksh. 5,000 initial balance each
                     </p>
@@ -6330,14 +6788,14 @@ auto_player_html = """
                             <input type="number" id="count" name="count" value="50" min="1" max="100">
                         </div>
                         <button type="submit" class="btn btn-primary">
-                            🚀 Create Fake Users
+                            ðŸš€ Create Fake Users
                         </button>
                     </form>
                 </div>
                 
                 <!-- Start/Stop Auto-Player -->
                 <div class="control-form">
-                    <h3>🎮 Auto-Player Controls</h3>
+                    <h3>ðŸŽ® Auto-Player Controls</h3>
                     <p style="color: var(--text-muted); margin-bottom: 15px;">
                         Start or stop the automatic game playing system
                     </p>
@@ -6346,12 +6804,12 @@ auto_player_html = """
                         {% if status.enabled %}
                         <input type="hidden" name="action" value="stop">
                         <button type="submit" class="btn btn-danger">
-                            ⏸️ Stop Auto-Player
+                            â¸ï¸ Stop Auto-Player
                         </button>
                         {% else %}
                         <input type="hidden" name="action" value="start">
                         <button type="submit" class="btn btn-primary">
-                            ▶️ Start Auto-Player
+                            â–¶ï¸ Start Auto-Player
                         </button>
                         {% endif %}
                     </form>
@@ -6359,7 +6817,7 @@ auto_player_html = """
                 
                 <!-- Refill Balances -->
                 <div class="control-form">
-                    <h3>💰 Refill Balances</h3>
+                    <h3>ðŸ’° Refill Balances</h3>
                     <p style="color: var(--text-muted); margin-bottom: 15px;">
                         Reset all fake user wallets to specified amount
                     </p>
@@ -6371,7 +6829,7 @@ auto_player_html = """
                             <input type="number" id="amount" name="amount" value="5000.00" step="0.01" min="100" max="100000">
                         </div>
                         <button type="submit" class="btn btn-info">
-                            💳 Refill All Wallets
+                            ðŸ’³ Refill All Wallets
                         </button>
                     </form>
                 </div>
@@ -6380,7 +6838,7 @@ auto_player_html = """
         
         <!-- Information Section -->
         <div class="info-section">
-            <h2>ℹ️ How It Works</h2>
+            <h2>â„¹ï¸ How It Works</h2>
             <ul>
                 <li><strong>Fake Users:</strong> Created with Ksh. 5,000 initial balance each</li>
                 <li><strong>Auto-Playing:</strong> Fake users automatically join games every round</li>
@@ -6395,7 +6853,7 @@ auto_player_html = """
         <!-- Footer Actions -->
         <div class="footer-actions">
             <a href="/admin/dashboard" class="back-link">
-                ← Back to Admin Dashboard
+                â† Back to Admin Dashboard
             </a>
         </div>
     </div>

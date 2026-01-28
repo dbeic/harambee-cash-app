@@ -389,12 +389,7 @@ def get_auto_player_status():
         }
     except Exception as e:
         logging.error(f"Error getting auto-player status: {e}")
-        return {}
-        
-user_suspensions = {}
-cursor.execute("SELECT user_id FROM user_suspensions WHERE suspension_end > CURRENT_TIMESTAMP")
-for row in cursor.fetchall():
-    user_suspensions[row[0]] = True                                  
+        return {}                                                                     
 
 # --- Database initialization ---
 def init_db():
@@ -830,7 +825,7 @@ def register():
                 logging.error(f"Database error during registration: {e}")
                 return render_template_string(register_html, error="Something went wrong. Try again later.")
 
-    # GET request Ã¢â‚¬â€ show registration form
+    # GET request Ã¢â‚¬â€ show registration form
     return render_template_string(register_html)
     
 # ============================
@@ -1228,9 +1223,14 @@ def admin_dashboard():
 
         cursor.execute("SELECT * FROM user_activity ORDER BY timestamp DESC LIMIT 100")
         logs = cursor.fetchall()
+        
+        user_suspensions = {}
+        cursor.execute("SELECT user_id FROM user_suspensions WHERE suspension_end > CURRENT_TIMESTAMP")
+        for row in cursor.fetchall():
+            user_suspensions[row[0]] = True        
 
     return render_template_string(
-        admin_html,
+        admin_dashboard,
         users=users,
         logs=logs,
         error=request.args.get("error"),
@@ -1904,17 +1904,17 @@ def game_status():
     return jsonify({'status': 'success' if game_just_won else 'pending'})
     
 # In your /admin/dashboard route, add these calculations:
-cursor.execute("SELECT SUM(wallet) FROM users")
-total_balance = cursor.fetchone()[0] or 0
+#cursor.execute("SELECT SUM(wallet) FROM users")
+#total_balance = cursor.fetchone()[0] or 0
 
-cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'in progress'")
-active_games = cursor.fetchone()[0]
+#cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'in progress'")
+#active_games = cursor.fetchone()[0]
 
-cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'completed'")
-completed_games = cursor.fetchone()[0]
+#cursor.execute("SELECT COUNT(*) FROM results WHERE status = 'completed'")
+#completed_games = cursor.fetchone()[0]
 
-cursor.execute("SELECT username FROM allowed_users")
-allowed_users = cursor.fetchall()                        
+#cursor.execute("SELECT username FROM allowed_users")
+#allowed_users = cursor.fetchall()                    
                   
         
 #NON MONETARY ADMIN FUNCTIONS
@@ -2393,7 +2393,7 @@ admin_deposit_html = """
         </table>
         
         <div class="back-link">
-            <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
+            <a href="/admin/dashboard">â† Back to Admin Dashboard</a>
         </div>
     </div>
 
@@ -2603,12 +2603,12 @@ withdrawal_receipt_html = """
             <strong>ðŸ“‹ FOR ADMIN PROCESSING:</strong><br>
             "Kindly send KES {{ "%.2f"|format(withdrawal[5]) }} to the user via platform M-Pesa number as per system approval."
             <br><br>
-            <strong>â„¹ï¸ VERIFICATION:</strong> Use independent M-Pesa records for transaction confirmation.
+            <strong>â„¹ï¸ VERIFICATION:</strong> Use independent M-Pesa records for transaction confirmation.
         </div>
         
         <div class="action-buttons">
-            <button class="btn btn-print" onclick="window.print()">ðŸ–¨ï¸ Print</button>
-            <a href="/" class="btn btn-home">ðŸ  Home</a>
+            <button class="btn btn-print" onclick="window.print()">ðŸ–¨ï¸ Print</button>
+            <a href="/" class="btn btn-home">ðŸ  Home</a>
         </div>
     </div>
 </body>
@@ -2773,12 +2773,12 @@ deposit_voucher_html = """
             <strong>ðŸ“‹ PRESENT TO ADMIN:</strong><br>
             "Kindly update my platform wallet account with the M-Pesa amount sent to your platform recently!"
             <br><br>
-            <strong>â„¹ï¸ NOTE:</strong> No M-Pesa confirmation message needed. Platform has official M-Pesa number for verification.
+            <strong>â„¹ï¸ NOTE:</strong> No M-Pesa confirmation message needed. Platform has official M-Pesa number for verification.
         </div>
         
         <div class="action-buttons">
-            <button class="btn btn-print" onclick="window.print()">ðŸ–¨ï¸ Print</button>
-            <a href="/" class="btn btn-home">ðŸ  Home</a>
+            <button class="btn btn-print" onclick="window.print()">ðŸ–¨ï¸ Print</button>
+            <a href="/" class="btn btn-home">ðŸ  Home</a>
         </div>
     </div>
 </body>
@@ -2946,12 +2946,12 @@ deposit_html = """
                 <li>âœ… Use official M-Pesa number only</li>
                 <li>âœ… Keep transaction details safe</li>
                 <li>âœ… Processing time: Within 2 hours</li>
-                <li>âŒ No fake deposits tolerated</li>
+                <li>âŒ No fake deposits tolerated</li>
             </ul>
         </div>
         
         <div class="back-link">
-            <a href="/">â† Back to Home</a>
+            <a href="/">â† Back to Home</a>
         </div>
     </div>
 </body>
@@ -3362,7 +3362,7 @@ cashbook_html = """
         <!-- Footer Actions -->
         <div class="footer-actions">
             <a href="/admin/dashboard" class="back-btn">
-                â† Back to Admin Dashboard
+                â† Back to Admin Dashboard
             </a>
         </div>
     </div>
@@ -3733,7 +3733,7 @@ base_html = """
     <!-- Navigation -->
     <nav>
         {% if not session.get('user_id') %}
-            <a href="{{ url_for('register') }}">ðŸ“ Register</a>
+            <a href="{{ url_for('register') }}">ðŸ“ Register</a>
             <a href="{{ url_for('login') }}">ðŸ”‘ Login</a>
         {% else %}
             <a href="{{ url_for('deposit') }}">ðŸ’³ Deposit</a>
@@ -3788,12 +3788,12 @@ base_html = """
                     <div style="color:var(--text-muted); margin-top:6px;">New games every 30 seconds with instant results</div>
                 </div>
                 <div class="feature-card">
-                    <div style="font-size:1.6rem;">ðŸ›¡ï¸</div>
+                    <div style="font-size:1.6rem;">ðŸ›¡ï¸</div>
                     <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Secure & Safe</div>
                     <div style="color:var(--text-muted); margin-top:6px;">Advanced security with fair gameplay guaranteed</div>
                 </div>
                 <div class="feature-card">
-                    <div style="font-size:1.6rem;">ðŸ†</div>
+                    <div style="font-size:1.6rem;">ðŸ†</div>
                     <div style="font-weight:700; margin-top:8px; color:var(--text-gold);">Community</div>
                     <div style="color:var(--text-muted); margin-top:6px;">Join thousands of players winning together</div>
                 </div>
@@ -3830,7 +3830,7 @@ base_html = """
                     <button class="offline-btn" onclick="showGamingTips()">ðŸ“š {% if session.get('user_id') %}Winning Strategies{% else %}Gaming Tips{% endif %}</button>
                     <button class="offline-btn" onclick="showPracticeMode()">ðŸ’ª {% if session.get('user_id') %}Practice Games{% else %}Practice Strategies{% endif %}</button>
                     {% if session.get('user_id') %}
-                    <button class="offline-btn" onclick="viewAchievements()">ðŸ† My Achievements</button>
+                    <button class="offline-btn" onclick="viewAchievements()">ðŸ† My Achievements</button>
                     {% endif %}
                 </div>
                 <div id="offlineContent" style="margin-top:14px;"></div>
@@ -3999,7 +3999,7 @@ base_html = """
                 for (let i = 0; i < 50; i++) {
                     setTimeout(() => {
                         const confetti = document.createElement('div');
-                        confetti.innerHTML = ['ðŸŽ‰', 'ðŸŽŠ', 'â­', 'ðŸ’«', 'âœ¨'][Math.floor(Math.random() * 5)];
+                        confetti.innerHTML = ['ðŸŽ‰', 'ðŸŽŠ', 'â­', 'ðŸ’«', 'âœ¨'][Math.floor(Math.random() * 5)];
                         confetti.style.cssText = `
                             position: fixed;
                             top: 100%;
@@ -4231,12 +4231,12 @@ base_html = """
                 msg = "ðŸŽ‰ Perfect! You're a Harambee Cash expert!"; 
                 unlockAchievement('trivia_master'); 
             } else if (triviaScore >= triviaQuestions.length / 2) { 
-                msg = "ðŸ‘ Great job! You know your stuff!"; 
+                msg = "ðŸ‘ Great job! You know your stuff!"; 
             } else { 
                 msg = "ðŸ’ª Keep learning! Read the tips to improve!"; 
             }
             const out = document.getElementById('offlineContent');
-            if (out) out.innerHTML = `<div style="text-align:center; padding:20px;"><h3>ðŸ† Trivia Complete!</h3><p>Final Score: ${triviaScore}/${triviaQuestions.length}</p><p>${msg}</p><button class="offline-btn" onclick="startTriviaGame()">Play Again</button></div>`;
+            if (out) out.innerHTML = `<div style="text-align:center; padding:20px;"><h3>ðŸ† Trivia Complete!</h3><p>Final Score: ${triviaScore}/${triviaQuestions.length}</p><p>${msg}</p><button class="offline-btn" onclick="startTriviaGame()">Play Again</button></div>`;
         }
     </script>
 
@@ -4245,7 +4245,7 @@ base_html = """
         function showGamingTips() {
             const tips = [
                 "ðŸ’° Set a budget before you start playing and stick to it",
-                "â° Take regular breaks - don't play for more than 1 hour continuously",
+                "â° Take regular breaks - don't play for more than 1 hour continuously",
                 "ðŸŽ¯ Understand the game rules completely before playing",
                 "ðŸ’¡ Never chase losses - if you're losing, take a break",
                 "ðŸ“Š Keep track of your wins and losses",
@@ -4300,7 +4300,7 @@ base_html = """
         function showAchievementNotification(name) {
             const n = document.createElement('div');
             n.className = 'achievement-notification';
-            n.innerHTML = `<div style="text-align:center;"><div style="font-size:1.4rem;">ðŸ†</div><h4 style="margin:6px 0;">Achievement Unlocked!</h4><div>${name}</div></div>`;
+            n.innerHTML = `<div style="text-align:center;"><div style="font-size:1.4rem;">ðŸ†</div><h4 style="margin:6px 0;">Achievement Unlocked!</h4><div>${name}</div></div>`;
             document.body.appendChild(n);
             setTimeout(() => { 
                 n.style.opacity = '0'; 
@@ -4311,7 +4311,7 @@ base_html = """
         }
 
         function viewAchievements() {
-            let html = '<h3>ðŸ† My Achievements</h3><div style="text-align:left;">';
+            let html = '<h3>ðŸ† My Achievements</h3><div style="text-align:left;">';
             Object.keys(achievements).forEach(k => {
                 const a = achievements[k];
                 html += `<div style="padding:12px; margin:8px 0; background:${a.unlocked ? 'rgba(0,201,177,0.12)' : 'rgba(0,0,0,0.12)'}; border-radius:10px;">
@@ -4422,8 +4422,8 @@ base_html = """
                                     <p><strong>ðŸ•’ Timestamp:</strong> ${game.timestamp}</p>
                                     <p><strong>ðŸ‘¥ Players:</strong> ${game.num_users}</p>
                                     <p><strong>ðŸ’° Total Amount:</strong> ${game.total_amount}</p>
-                                    <p><strong>ðŸ† Winner:</strong> ${game.winner}</p>
-                                    <p><strong>ðŸŽ Win Amount:</strong> ${game.winner_amount}</p>
+                                    <p><strong>ðŸ† Winner:</strong> ${game.winner}</p>
+                                    <p><strong>ðŸŽ Win Amount:</strong> ${game.winner_amount}</p>
                                     <p><strong>ðŸ“Š Outcome:</strong> ${game.outcome_message}</p>
                                 </div>
                             `;
@@ -4637,8 +4637,8 @@ base_html = """
                                         <p><strong>ðŸ•’ Timestamp:</strong> ${game.timestamp}</p>
                                         <p><strong>ðŸ‘¥ Players:</strong> ${game.num_users}</p>
                                         <p><strong>ðŸ’° Total Amount:</strong> ${game.total_amount}</p>
-                                        <p><strong>ðŸ† Winner:</strong> ${game.winner}</p>
-                                        <p><strong>ðŸŽ Win Amount:</strong> ${game.winner_amount}</p>
+                                        <p><strong>ðŸ† Winner:</strong> ${game.winner}</p>
+                                        <p><strong>ðŸŽ Win Amount:</strong> ${game.winner_amount}</p>
                                         <p><strong>ðŸ“Š Outcome:</strong> ${game.outcome_message}</p>
                                     `;
                                     resultsContainer.appendChild(div);
@@ -4671,7 +4671,7 @@ base_html = """
                     event.preventDefault();
                     event.stopImmediatePropagation();
                     if (window.submissionProtector.isSubmitting) {
-                        window.submissionProtector.showTemporaryMessage('â³ Processing your previous request...', 'warning');
+                        window.submissionProtector.showTemporaryMessage('â³ Processing your previous request...', 'warning');
                     } else {
                         window.submissionProtector.showTemporaryMessage('âœ… Already enrolled in current game!', 'success');
                     }
@@ -4861,7 +4861,7 @@ admin_login_html = """
 </html>  
 """
 
-admin_html = """
+admin_dashboard = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6128,7 +6128,7 @@ TERMS_CONTENT = """
         </script>      
         
         <p><strong>Last Updated:</strong> 6th February 2025</p>
-        <p>Welcome to <strong>Harambee Cash</strong> Ã¢â‚¬â€ your platform for exciting gameplay and rewards! Before getting started, please read through our Terms and Conditions carefully. By using our platform, you agree to these terms.</p>
+        <p>Welcome to <strong>Harambee Cash</strong> Ã¢â‚¬â€ your platform for exciting gameplay and rewards! Before getting started, please read through our Terms and Conditions carefully. By using our platform, you agree to these terms.</p>
 
         <h3>1. Acceptance of Terms</h3>
         <p>By accessing or using Harambee Cash, you agree to comply with these Terms and Conditions. If you do not agree with any part, please do not use the platform.</p>
@@ -6142,7 +6142,7 @@ TERMS_CONTENT = """
         <h3>3. Account Registration</h3>
         <ul>
             <li>An account is required to access the platform's features.</li>
-            <li>Keep your login credentials secureÃ¢â‚¬â€you are accountable for all activity under your account.</li>
+            <li>Keep your login credentials secureÃ¢â‚¬â€you are accountable for all activity under your account.</li>
         </ul>
 
         <h3>4. Game Rules</h3>
@@ -6771,12 +6771,12 @@ auto_player_html = """
         
         <!-- Control Panel -->
         <div class="control-panel">
-            <h2>âš™ï¸ Control Actions</h2>
+            <h2>âš™ï¸ Control Actions</h2>
             
             <div class="control-grid">
                 <!-- Create Fake Users -->
                 <div class="control-form">
-                    <h3>ðŸ“ Create Fake Users</h3>
+                    <h3>ðŸ“ Create Fake Users</h3>
                     <p style="color: var(--text-muted); margin-bottom: 15px;">
                         Create 50 fake users with Ksh. 5,000 initial balance each
                     </p>
@@ -6804,12 +6804,12 @@ auto_player_html = """
                         {% if status.enabled %}
                         <input type="hidden" name="action" value="stop">
                         <button type="submit" class="btn btn-danger">
-                            â¸ï¸ Stop Auto-Player
+                            â¸ï¸ Stop Auto-Player
                         </button>
                         {% else %}
                         <input type="hidden" name="action" value="start">
                         <button type="submit" class="btn btn-primary">
-                            â–¶ï¸ Start Auto-Player
+                            â–¶ï¸ Start Auto-Player
                         </button>
                         {% endif %}
                     </form>
@@ -6838,7 +6838,7 @@ auto_player_html = """
         
         <!-- Information Section -->
         <div class="info-section">
-            <h2>â„¹ï¸ How It Works</h2>
+            <h2>â„¹ï¸ How It Works</h2>
             <ul>
                 <li><strong>Fake Users:</strong> Created with Ksh. 5,000 initial balance each</li>
                 <li><strong>Auto-Playing:</strong> Fake users automatically join games every round</li>
@@ -6853,7 +6853,7 @@ auto_player_html = """
         <!-- Footer Actions -->
         <div class="footer-actions">
             <a href="/admin/dashboard" class="back-link">
-                â† Back to Admin Dashboard
+                â† Back to Admin Dashboard
             </a>
         </div>
     </div>

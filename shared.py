@@ -11,9 +11,9 @@ from datetime import datetime, timezone
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")  # Reduced to INFO
 
 # Load database configuration from environment
-ADMIN_DATABASE = os.getenv('ADMIN_DATABASE')
-if not ADMIN_DATABASE:
-    raise ValueError("ADMIN_DATABASE environment variable not set")
+CASH_DATABASE = os.getenv('CASH_DATABASE')
+if not CASH_DATABASE:
+    raise ValueError("CASH_DATABASE environment variable not set")
 
 # Create connection pool with error handling
 db_pool = None
@@ -22,7 +22,7 @@ try:
     db_pool = pool.SimpleConnectionPool(
         minconn=1,
         maxconn=20,  # Increased max connections
-        dsn=ADMIN_DATABASE
+        dsn=CASH_DATABASE
     )
     logging.info("Database connection pool created successfully")
 except Exception as e:
@@ -45,7 +45,7 @@ def get_db_connection():
         # Connection is broken, create new one
         if conn:
             conn.close()
-        conn = psycopg2.connect(ADMIN_DATABASE)
+        conn = psycopg2.connect( CASH_DATABASE)
         yield conn
         conn.close()
     except Exception as e:
